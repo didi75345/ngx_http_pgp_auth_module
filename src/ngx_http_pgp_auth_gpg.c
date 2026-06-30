@@ -11,6 +11,7 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -61,6 +62,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     char         keyringz[PATH_MAX];
     char         out[8192];
     char        *p, *line, *save;
+    sigset_t     chld, prev;
 
     res->valid = 0;
     res->fpr_len = 0;
@@ -104,9 +106,22 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         return NGX_ERROR;
     }
 
+    /*
+     * Block SIGCHLD around the fork/wait. nginx installs its own SIGCHLD
+     * handler that reaps every child it sees; without this it would reap our
+     * gpg process before we can waitpid() for it, stealing the exit status and
+     * leaving verification unreliable (the bug shows up under real browser use,
+     * not single curl requests). The child restores the mask before exec so
+     * gpg runs normally.
+     */
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, &prev);
+
     pid = fork();
     if (pid == -1) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno, "pgp_auth: fork() failed");
+        sigprocmask(SIG_SETMASK, &prev, NULL);
         close(pfd[0]);
         close(pfd[1]);
         ngx_http_pgp_gpg_cleanup(home, msgpath);
@@ -125,6 +140,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         for (fd = 3; fd < 1024; fd++) {
             close(fd);
         }
+        sigprocmask(SIG_SETMASK, &prev, NULL);   /* gpg runs with a normal mask */
         execlp("gpg", "gpg",
                "--homedir", home,
                "--no-default-keyring",
@@ -163,6 +179,8 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     while (waitpid(pid, &status, 0) == -1 && ngx_errno == NGX_EINTR) {
         /* retry */
     }
+
+    sigprocmask(SIG_SETMASK, &prev, NULL);
 
     ngx_http_pgp_gpg_cleanup(home, msgpath);
 
