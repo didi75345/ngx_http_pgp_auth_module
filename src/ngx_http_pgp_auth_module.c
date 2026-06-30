@@ -400,7 +400,9 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     ngx_str_set(&r->headers_out.location->key, "Location");
     r->headers_out.location->value = r->uri;
 
-    return NGX_HTTP_MOVED_TEMPORARILY;
+    /* 303 See Other: the correct Post/Redirect/Get response -- the client
+     * re-fetches the target with GET, not by repeating the POST. */
+    return NGX_HTTP_SEE_OTHER;
 }
 
 
@@ -619,6 +621,16 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
 
     plcf = ngx_http_get_module_loc_conf(r, ngx_http_pgp_auth_module);
 
+    /*
+     * Don't keep this connection alive after answering the POST. Producing the
+     * response (challenge re-render or the 302) from a body post-handler in the
+     * preaccess phase leaves the keepalive connection in a state where the
+     * client's next request on it stalls -- which is exactly what a browser
+     * does when it reuses the connection to follow the redirect. Closing the
+     * connection makes the browser open a fresh one for the next request.
+     */
+    r->keepalive = 0;
+
     if (ngx_http_pgp_read_body(r, &body) != NGX_OK) {
         ngx_http_finalize_request(r,
             ngx_http_pgp_send_challenge(r, plcf, 1));
@@ -632,14 +644,14 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
     rc = ngx_http_pgp_verify_challenge(r, plcf, signed_msg.data,
                                        signed_msg.len);
 
-    if (rc == NGX_HTTP_MOVED_TEMPORARILY) {
+    if (rc == NGX_HTTP_SEE_OTHER) {
         /*
          * Cookie + Location are already set on headers_out; let nginx's
          * special-response machinery build the redirect (it preserves our
          * Set-Cookie header). Finalizing with the 3xx code is what triggers
          * that, so we must NOT have sent a header ourselves first.
          */
-        ngx_http_finalize_request(r, NGX_HTTP_MOVED_TEMPORARILY);
+        ngx_http_finalize_request(r, NGX_HTTP_SEE_OTHER);
         return;
     }
 

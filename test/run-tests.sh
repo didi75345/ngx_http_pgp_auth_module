@@ -115,13 +115,27 @@ printf '%s' "$CH" | gpg --clearsign --batch > "$WORK/s.asc" 2>/dev/null
 
 curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/s.asc" \
      -D "$WORK/h1" -o /dev/null -w '%{http_code}' > "$WORK/c2"
-[ "$(cat "$WORK/c2")" = 302 ] && grep -qi '^set-cookie: pgp_session=' "$WORK/h1" \
-    && ok "valid signature returns 302 + session cookie" || bad "valid sign-in"
+[ "$(cat "$WORK/c2")" = 303 ] && grep -qi '^set-cookie: pgp_session=' "$WORK/h1" \
+    && ok "valid signature returns 303 + session cookie" || bad "valid sign-in"
 
 CK="$(grep -i '^set-cookie:' "$WORK/h1" | sed 's/[Ss]et-[Cc]ookie: //;s/;.*//' | tr -d '\r')"
 curl -s -b "$CK" "$base/" -o "$WORK/p2" -w '%{http_code}' > "$WORK/c3"
 [ "$(cat "$WORK/c3")" = 200 ] && grep -q 'SECRET-OK' "$WORK/p2" \
     && ok "session cookie grants access" || bad "session access"
+
+# Full browser flow on one connection: POST login, follow the redirect, land on
+# the protected page -- with --max-time so a keepalive/redirect stall fails
+# loudly instead of hanging. (A real browser reuses the connection to follow
+# the redirect, which a plain non-following POST never exercises.)
+curl -s "$base/" -o "$WORK/lp" >/dev/null
+LCH="$(challenge "$WORK/lp")"
+printf '%s' "$LCH" | gpg --clearsign --batch > "$WORK/ls.asc" 2>/dev/null
+curl -s -L --max-time 15 -c "$WORK/lj" -b "$WORK/lj" "$base/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/ls.asc" -o "$WORK/lf" -w '%{http_code}' \
+     > "$WORK/lc" 2>/dev/null
+[ "$(cat "$WORK/lc")" = 200 ] && grep -q 'SECRET-OK' "$WORK/lf" \
+    && ok "login + follow redirect reaches protected page" \
+    || bad "redirect-follow login (got $(cat "$WORK/lc"))"
 
 echo "== attack cases (all must be rejected) =="
 
