@@ -147,6 +147,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
                "--keyring", keyringz,
                "--status-fd", "1",
                "--batch", "--no-tty",
+               "--no-autostart",       /* signature verify needs no gpg-agent */
                "--verify", msgpath,
                (char *) NULL);
         _exit(127);
