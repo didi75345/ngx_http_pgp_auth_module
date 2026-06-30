@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -19,6 +21,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+
+
+/* Upper bound on a single gpg verification before it is killed. */
+#define NGX_HTTP_PGP_GPG_TIMEOUT_MS  5000
+
+
+static int64_t
+ngx_http_pgp_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 
 static void
@@ -62,6 +78,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     char         keyringz[PATH_MAX];
     char         out[8192];
     char        *p, *line, *save;
+    int64_t      deadline;
     sigset_t     chld, prev;
 
     res->valid = 0;
@@ -156,8 +173,39 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     /* parent */
     close(pfd[1]);
 
+    /*
+     * Read gpg's output, but never let a stuck gpg block the worker forever:
+     * poll with a deadline and SIGKILL the child if it overruns. Verification
+     * is normally a few milliseconds, so a several-second cap is generous.
+     */
     off = 0;
+    deadline = ngx_http_pgp_now_ms() + NGX_HTTP_PGP_GPG_TIMEOUT_MS;
     for ( ;; ) {
+        int64_t        left = deadline - ngx_http_pgp_now_ms();
+        struct pollfd  pe = { pfd[0], POLLIN, 0 };
+
+        if (left <= 0) {
+            kill(pid, SIGKILL);
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "pgp_auth: gpg verify timed out, killed");
+            break;
+        }
+
+        n = poll(&pe, 1, (int) left);
+        if (n == 0) {
+            kill(pid, SIGKILL);
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "pgp_auth: gpg verify timed out, killed");
+            break;
+        }
+        if (n < 0) {
+            if (ngx_errno == NGX_EINTR) {
+                continue;
+            }
+            kill(pid, SIGKILL);
+            break;
+        }
+
         n = read(pfd[0], out + off, sizeof(out) - 1 - off);
         if (n > 0) {
             off += (size_t) n;
