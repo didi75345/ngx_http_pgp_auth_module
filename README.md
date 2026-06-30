@@ -103,6 +103,9 @@ a bad signature.
   Strict single-use would require a shared store (e.g. Redis); deliberately left
   out to avoid the dependency.
 
+For the threat model, defensive design, and how memory safety is verified
+(ASan/UBSan + the attack suite), see [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
