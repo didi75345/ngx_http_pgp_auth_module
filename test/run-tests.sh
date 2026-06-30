@@ -1,0 +1,168 @@
+#!/bin/sh
+# End-to-end test suite for ngx_http_pgp_auth.
+#
+# Drives a real nginx instance through the full PGP login flow and a set of
+# attack cases. Exits non-zero on any failure, so it doubles as the CI gate.
+#
+# Requires on PATH: nginx, gpg, curl. Override the binary/module if needed:
+#   NGINX_BIN=/usr/sbin/nginx  MODULE_SO=/path/ngx_http_pgp_auth_module.so
+set -eu
+
+NGINX_BIN="${NGINX_BIN:-nginx}"
+MODULE_SO="${MODULE_SO:-}"
+PORT="${PORT:-8899}"
+WORK="$(mktemp -d)"
+PASS=0
+FAIL=0
+
+cleanup() {
+    [ -f "$WORK/logs/nginx.pid" ] && kill "$(cat "$WORK/logs/nginx.pid")" 2>/dev/null || true
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
+
+mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html" "$WORK/gpg"
+chmod 700 "$WORK/gpg"
+export GNUPGHOME="$WORK/gpg"
+
+# --- test key + keyring (the allowed signer) ---------------------------------
+cat > "$WORK/keyparams" <<EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Subkey-Type: ecdh
+Subkey-Curve: cv25519
+Name-Real: PGP Auth Test
+Name-Email: test@example.com
+Expire-Date: 0
+%commit
+EOF
+gpg --batch --gen-key "$WORK/keyparams" >/dev/null 2>&1
+gpg --export test@example.com > "$WORK/pubkeys.gpg"
+
+# a second key that is NOT in the keyring (the attacker)
+export GNUPGHOME="$WORK/gpg2"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+cat > "$WORK/kp2" <<EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Name-Real: Attacker
+Name-Email: evil@example.com
+Expire-Date: 0
+%commit
+EOF
+gpg --batch --gen-key "$WORK/kp2" >/dev/null 2>&1
+export GNUPGHOME="$WORK/gpg"
+
+head -c 48 /dev/urandom | base64 > "$WORK/session.key"
+echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
+
+# --- nginx config ------------------------------------------------------------
+{
+    [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
+    # When running as root (CI/Docker), keep the worker as root so it can read
+    # the keyring under a 0700 temp dir. In production the worker user simply
+    # needs read access to the keyring.
+    [ "$(id -u)" = 0 ] && echo "user root;"
+    cat <<EOF
+worker_processes 1;
+daemon off;
+error_log $WORK/logs/error.log info;
+pid $WORK/logs/nginx.pid;
+events { worker_connections 64; }
+http {
+    server {
+        listen $PORT;
+        location / {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_challenge_timeout 300s;
+            pgp_session_timeout 24h;
+            root $WORK/html;
+            index index.html;
+        }
+        location /short/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_challenge_timeout 1s;
+            root $WORK/html;
+        }
+    }
+}
+EOF
+} > "$WORK/conf/nginx.conf"
+
+"$NGINX_BIN" -p "$WORK" -c conf/nginx.conf -t
+"$NGINX_BIN" -p "$WORK" -c conf/nginx.conf &
+sleep 1
+
+base="http://127.0.0.1:$PORT"
+challenge() { grep -oE 'v1\|[0-9]+\|[0-9a-f]+\|[0-9a-f]+' "$1" | head -1; }
+
+echo "== positive flow =="
+
+curl -s "$base/" -o "$WORK/p1" -w '%{http_code}' > "$WORK/c1"
+[ "$(cat "$WORK/c1")" = 200 ] && grep -q 'v1|' "$WORK/p1" \
+    && ok "unauth GET returns challenge page" || bad "challenge page"
+
+CH="$(challenge "$WORK/p1")"
+printf '%s' "$CH" | gpg --clearsign --batch > "$WORK/s.asc" 2>/dev/null
+
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/s.asc" \
+     -D "$WORK/h1" -o /dev/null -w '%{http_code}' > "$WORK/c2"
+[ "$(cat "$WORK/c2")" = 302 ] && grep -qi '^set-cookie: pgp_session=' "$WORK/h1" \
+    && ok "valid signature returns 302 + session cookie" || bad "valid sign-in"
+
+CK="$(grep -i '^set-cookie:' "$WORK/h1" | sed 's/[Ss]et-[Cc]ookie: //;s/;.*//' | tr -d '\r')"
+curl -s -b "$CK" "$base/" -o "$WORK/p2" -w '%{http_code}' > "$WORK/c3"
+[ "$(cat "$WORK/c3")" = 200 ] && grep -q 'SECRET-OK' "$WORK/p2" \
+    && ok "session cookie grants access" || bad "session access"
+
+echo "== attack cases (all must be rejected) =="
+
+curl -s -H 'Cookie: pgp_session=9999999999|DEADBEEF|ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+     "$base/" -o "$WORK/n1" >/dev/null
+grep -q 'SECRET-OK' "$WORK/n1" && bad "forged cookie blocked" || ok "forged cookie blocked"
+
+export GNUPGHOME="$WORK/gpg2"
+printf '%s' "$CH" | gpg --clearsign --batch > "$WORK/evil.asc" 2>/dev/null
+export GNUPGHOME="$WORK/gpg"
+curl -s "$base/" -o "$WORK/np" >/dev/null
+CH2="$(challenge "$WORK/np")"
+export GNUPGHOME="$WORK/gpg2"
+printf '%s' "$CH2" | gpg --clearsign --batch > "$WORK/evil.asc" 2>/dev/null
+export GNUPGHOME="$WORK/gpg"
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/evil.asc" \
+     -D "$WORK/h2" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/h2" && bad "unknown-key signature rejected" \
+    || ok "unknown-key signature rejected"
+
+FAKE="v1|9999999999|00000000000000000000000000000000|0000000000000000000000000000000000000000000000000000000000000000"
+printf '%s' "$FAKE" | gpg --clearsign --batch > "$WORK/fake.asc" 2>/dev/null
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/fake.asc" \
+     -D "$WORK/h3" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/h3" && bad "forged challenge (bad HMAC) rejected" \
+    || ok "forged challenge (bad HMAC) rejected"
+
+curl -s "$base/short/" -o "$WORK/sp" >/dev/null
+CHS="$(challenge "$WORK/sp")"
+printf '%s' "$CHS" | gpg --clearsign --batch > "$WORK/se.asc" 2>/dev/null
+sleep 2
+curl -s -X POST "$base/short/?__pgp_auth=1" --data-urlencode "signed@$WORK/se.asc" \
+     -D "$WORK/h4" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/h4" && bad "expired challenge rejected" \
+    || ok "expired challenge rejected"
+
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode 'signed=not a pgp message' \
+     -D "$WORK/h5" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/h5" && bad "garbage body rejected" \
+    || ok "garbage body rejected"
+
+echo
+echo "RESULT: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
