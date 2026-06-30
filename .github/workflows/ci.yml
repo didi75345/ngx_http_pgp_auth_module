@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Build + functional/attack suite on both Debian targets.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: bookworm
+            nginx: 1.22.1
+          - release: trixie
+            nginx: 1.26.3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test on Debian ${{ matrix.release }} (nginx ${{ matrix.nginx }})
+        run: |
+          docker build -f test/Dockerfile \
+            --build-arg DEBIAN_RELEASE=${{ matrix.release }} \
+            --build-arg NGINX_VERSION=${{ matrix.nginx }} \
+            -t pgpauth:${{ matrix.release }} .
+          docker run --rm pgpauth:${{ matrix.release }}
+
+  # Memory-safety gate: rebuild with ASan+UBSan and exercise every input path.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev gnupg curl
+      - name: Build with sanitizers and exercise all paths
+        run: sh test/sanitize.sh
