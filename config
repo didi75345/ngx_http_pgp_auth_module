@@ -1,0 +1,18 @@
+ngx_addon_name=ngx_http_pgp_auth_module
+
+PGP_AUTH_SRCS="$ngx_addon_dir/src/ngx_http_pgp_auth_module.c \
+               $ngx_addon_dir/src/ngx_http_pgp_auth_gpg.c"
+
+if test -n "$ngx_module_link"; then
+    # nginx >= 1.9.11: dynamic-module aware build
+    ngx_module_type=HTTP
+    ngx_module_name=ngx_http_pgp_auth_module
+    ngx_module_srcs="$PGP_AUTH_SRCS"
+    ngx_module_libs="-lcrypto"
+    . auto/module
+else
+    # legacy static build
+    HTTP_MODULES="$HTTP_MODULES ngx_http_pgp_auth_module"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $PGP_AUTH_SRCS"
+    CORE_LIBS="$CORE_LIBS -lcrypto"
+fi
