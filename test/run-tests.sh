@@ -163,6 +163,26 @@ curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/fake.asc" \
 grep -qi '^set-cookie:' "$WORK/h3" && bad "forged challenge (bad HMAC) rejected" \
     || ok "forged challenge (bad HMAC) rejected"
 
+# Challenge-binding: a real signature (by a keyring key) over unrelated text,
+# with a genuine unexpired challenge placed OUTSIDE the signed region. Must be
+# rejected -- the challenge only counts if it is inside what gpg verified.
+printf 'unrelated text' | gpg --clearsign --batch > "$WORK/unrel.asc" 2>/dev/null
+curl -s "$base/" -o "$WORK/bp" >/dev/null
+BCH="$(challenge "$WORK/bp")"
+{ cat "$WORK/unrel.asc"; printf '\n%s\n' "$BCH"; } > "$WORK/append.txt"
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/append.txt" \
+     -D "$WORK/h3b" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/h3b" && bad "challenge appended outside signature rejected" \
+    || ok "challenge appended outside signature rejected"
+
+curl -s "$base/" -o "$WORK/bp2" >/dev/null
+BCH2="$(challenge "$WORK/bp2")"
+{ printf '%s\n' "$BCH2"; cat "$WORK/unrel.asc"; } > "$WORK/prepend.txt"
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/prepend.txt" \
+     -D "$WORK/h3c" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/h3c" && bad "challenge prepended outside signature rejected" \
+    || ok "challenge prepended outside signature rejected"
+
 curl -s "$base/short/" -o "$WORK/sp" >/dev/null
 CHS="$(challenge "$WORK/sp")"
 printf '%s' "$CHS" | gpg --clearsign --batch > "$WORK/se.asc" 2>/dev/null

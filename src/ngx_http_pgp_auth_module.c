@@ -44,6 +44,7 @@ typedef struct {
     ngx_str_t    keyring;
     time_t       challenge_timeout;   /* seconds a challenge stays valid    */
     time_t       session_timeout;     /* seconds; 0 == unlimited            */
+    ngx_flag_t   cookie_secure;       /* add "; Secure" to the cookie       */
     ngx_str_t    secret_file;
     ngx_str_t    secret;              /* loaded HMAC secret bytes           */
 } ngx_http_pgp_auth_loc_conf_t;
@@ -106,6 +107,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, secret_file),
+      NULL },
+
+    { ngx_string("pgp_session_cookie_secure"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, cookie_secure),
       NULL },
 
       ngx_null_command
@@ -273,17 +281,36 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
 {
     time_t                          exp;
     u_char                         *p, *last, *line_end, *s1, *s2, *s3;
-    ngx_str_t                       payload, mac_have, mac_want, ch, fpr;
+    ngx_str_t                       payload, mac_have, mac_want, fpr;
     ngx_http_pgp_verify_result_t    vr;
 
-    /* locate our challenge line ("v1|...") inside the signed text */
-    last = msg + len;
-    for (p = msg; p + 3 <= last; p++) {
+    /*
+     * Verify the PGP signature FIRST, and from here on look at only the bytes
+     * gpg actually verified (vr.plaintext) -- never the raw submitted body.
+     * Otherwise an attacker could take any message signed by a keyring key and
+     * append/prepend a genuine challenge outside the signed region.
+     */
+    if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->keyring, msg, len,
+                                &vr) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    if (!vr.valid) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: signature not from a keyring key");
+        return NGX_DECLINED;
+    }
+
+    /* locate our challenge line ("v1|...") inside the SIGNED plaintext */
+    last = vr.plaintext + vr.plaintext_len;
+    for (p = vr.plaintext; p + 3 <= last; p++) {
         if (p[0] == 'v' && p[1] == '1' && p[2] == '|') {
             break;
         }
     }
     if (p + 3 > last) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: no challenge inside the signed content");
         return NGX_DECLINED;
     }
 
@@ -295,19 +322,16 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
         line_end--;
     }
 
-    ch.data = p;
-    ch.len = line_end - p;
-
     /* split: v1 | exp | nonce | mac */
-    s1 = ngx_strlchr(ch.data, line_end, '|');                 /* after v1   */
+    s1 = ngx_strlchr(p, line_end, '|');                       /* after v1   */
     if (s1 == NULL) { return NGX_DECLINED; }
     s2 = ngx_strlchr(s1 + 1, line_end, '|');                  /* after exp  */
     if (s2 == NULL) { return NGX_DECLINED; }
     s3 = ngx_strlchr(s2 + 1, line_end, '|');                  /* after nonce*/
     if (s3 == NULL) { return NGX_DECLINED; }
 
-    payload.data = ch.data;
-    payload.len = s3 - ch.data;                               /* v1|exp|nonce */
+    payload.data = p;
+    payload.len = s3 - p;                                     /* v1|exp|nonce */
 
     mac_have.data = s3 + 1;
     mac_have.len = line_end - (s3 + 1);
@@ -327,18 +351,6 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
     if (exp == NGX_ERROR || exp < ngx_time()) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: challenge expired");
-        return NGX_DECLINED;
-    }
-
-    /* the challenge is genuine and fresh; now check the PGP signature */
-    if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->keyring, msg, len,
-                                &vr) != NGX_OK)
-    {
-        return NGX_ERROR;
-    }
-    if (!vr.valid) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "pgp_auth: signature not from a keyring key");
         return NGX_DECLINED;
     }
 
@@ -379,15 +391,17 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     set_cookie->hash = 1;
     ngx_str_set(&set_cookie->key, "Set-Cookie");
 
+    /* Secure flag controlled by pgp_session_cookie_secure (default on). */
     set_cookie->value.data = ngx_pnalloc(r->pool,
         sizeof(NGX_HTTP_PGP_COOKIE "=") - 1 + plen + 1 + mac.len
-        + sizeof("; Path=/; HttpOnly; SameSite=Lax") - 1);
+        + sizeof("; Path=/; HttpOnly; SameSite=Lax; Secure") - 1);
     if (set_cookie->value.data == NULL) {
         return NGX_ERROR;
     }
     set_cookie->value.len = ngx_sprintf(set_cookie->value.data,
-        "%s=%*s|%V; Path=/; HttpOnly; SameSite=Lax",
-        NGX_HTTP_PGP_COOKIE, plen, payload, &mac)
+        "%s=%*s|%V; Path=/; HttpOnly; SameSite=Lax%s",
+        NGX_HTTP_PGP_COOKIE, plen, payload, &mac,
+        plcf->cookie_secure ? "; Secure" : "")
         - set_cookie->value.data;
 
     /* redirect to the same URI without the auth query argument */
@@ -624,7 +638,7 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
     /*
      * Don't keep this connection alive after answering the POST. Producing the
      * response (challenge re-render or the 302) from a body post-handler in the
-     * preaccess phase leaves the keepalive connection in a state where the
+     * access phase leaves the keepalive connection in a state where the
      * client's next request on it stalls -- which is exactly what a browser
      * does when it reuses the connection to follow the redirect. Closing the
      * connection makes the browser open a fresh one for the next request.
@@ -716,6 +730,7 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->enable = NGX_CONF_UNSET;
     conf->challenge_timeout = NGX_CONF_UNSET;
     conf->session_timeout = NGX_CONF_UNSET;
+    conf->cookie_secure = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -782,10 +797,13 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_str_value(conf->keyring, prev->keyring,
                              "/etc/nginx/pubkeys.gpg");
+    /* Shorter defaults shrink the replay window and session blast radius; both
+     * remain fully configurable. */
     ngx_conf_merge_sec_value(conf->challenge_timeout, prev->challenge_timeout,
-                             300);
+                             120);
     ngx_conf_merge_sec_value(conf->session_timeout, prev->session_timeout,
-                             86400);
+                             3600);
+    ngx_conf_merge_value(conf->cookie_secure, prev->cookie_secure, 1);
     ngx_conf_merge_str_value(conf->secret_file, prev->secret_file, "");
 
     if (!conf->enable) {
@@ -854,7 +872,12 @@ ngx_http_pgp_auth_init(ngx_conf_t *cf)
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
+    /*
+     * ACCESS phase (like auth_basic), not PREACCESS: this keeps the module
+     * *after* limit_req, so operators can rate-limit login attempts before a
+     * gpg verification is ever forked.
+     */
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }
