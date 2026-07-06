@@ -75,14 +75,17 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     size_t       off;
     char         home[] = "/tmp/ngx_pgp_XXXXXX";
     char         msgpath[PATH_MAX];
+    char         plainpath[PATH_MAX];
     char         keyringz[PATH_MAX];
     char         out[8192];
     char        *p, *line, *save;
     int64_t      deadline;
+    ngx_int_t    good, bad;
     sigset_t     chld, prev;
 
     res->valid = 0;
     res->fpr_len = 0;
+    res->plaintext_len = 0;
 
     if (keyring->len == 0 || keyring->len >= PATH_MAX) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
@@ -99,6 +102,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     }
 
     (void) ngx_snprintf((u_char *) msgpath, sizeof(msgpath), "%s/m%Z", home);
+    (void) ngx_snprintf((u_char *) plainpath, sizeof(plainpath), "%s/p%Z", home);
 
     fd = open(msgpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd == -1) {
@@ -146,26 +150,37 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     }
 
     if (pid == 0) {
+        int devnull;
+
         /*
-         * child: capture both the machine-readable status (stdout, via
-         * --status-fd 1) and gpg's human-readable diagnostics (stderr) on the
-         * same pipe, so a failure such as an unreadable keyring is logged
-         * rather than silently looking like "no valid signature".
+         * child: machine-readable status goes to the pipe (stdout, via
+         * --status-fd 1); the verified plaintext goes to --output plainpath;
+         * and gpg's human-readable chatter (stderr) is discarded. Keeping the
+         * status stream separate from stderr is deliberate: an attacker must
+         * not be able to smuggle a forged "VALIDSIG" line in via stderr.
          */
         dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
+        devnull = open("/dev/null", O_WRONLY);
+        if (devnull != -1) {
+            dup2(devnull, STDERR_FILENO);
+        }
         for (fd = 3; fd < 1024; fd++) {
             close(fd);
         }
         sigprocmask(SIG_SETMASK, &prev, NULL);   /* gpg runs with a normal mask */
+        /*
+         * --decrypt (not --verify) so gpg writes the signed plaintext to
+         * --output; --verify alone produces no output to bind the challenge to.
+         */
         execlp("gpg", "gpg",
                "--homedir", home,
                "--no-default-keyring",
                "--keyring", keyringz,
                "--status-fd", "1",
-               "--batch", "--no-tty",
+               "--output", plainpath,
+               "--batch", "--no-tty", "--yes",
                "--no-autostart",       /* signature verify needs no gpg-agent */
-               "--verify", msgpath,
+               "--decrypt", msgpath,
                (char *) NULL);
         _exit(127);
     }
@@ -231,34 +246,77 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
 
     sigprocmask(SIG_SETMASK, &prev, NULL);
 
+    /* Capture the verified plaintext before cleanup wipes the temp dir. */
+    fd = open(plainpath, O_RDONLY);
+    if (fd != -1) {
+        off = 0;
+        for ( ;; ) {
+            n = read(fd, res->plaintext + off,
+                     sizeof(res->plaintext) - off);
+            if (n > 0) {
+                off += (size_t) n;
+                if (off >= sizeof(res->plaintext)) {
+                    break;
+                }
+                continue;
+            }
+            if (n < 0 && ngx_errno == NGX_EINTR) {
+                continue;
+            }
+            break;
+        }
+        res->plaintext_len = off;
+        close(fd);
+    }
+
     ngx_http_pgp_gpg_cleanup(home, msgpath);
 
     /*
-     * Parse gpg --status-fd output. A trustworthy good signature emits:
+     * Parse gpg --status-fd output. Only trust lines carrying the exact
+     * "[GNUPG:] " machine prefix (not human text), require a real fingerprint,
+     * and reject the signature outright if gpg reported it revoked, made by an
+     * expired key, or itself expired/bad.
      *   [GNUPG:] VALIDSIG <primary-key-fpr> <date> <timestamp> ...
-     * The first token after VALIDSIG is the signing key fingerprint.
      */
+    good = 0;
+    bad = 0;
     for (line = strtok_r(out, "\n", &save);
          line != NULL;
          line = strtok_r(NULL, "\n", &save))
     {
-        p = strstr(line, "VALIDSIG ");
-        if (p == NULL) {
-            continue;
+        if (ngx_strncmp(line, "[GNUPG:] ", 9) != 0) {
+            continue;                          /* not a status line */
         }
-        p += sizeof("VALIDSIG ") - 1;
+        p = line + 9;
 
-        n = 0;
-        while (p[n] != '\0' && p[n] != ' '
-               && (size_t) n < sizeof(res->fpr) - 1)
+        if (ngx_strncmp(p, "VALIDSIG ", 9) == 0) {
+            p += 9;
+            n = 0;
+            while (p[n] != '\0' && p[n] != ' '
+                   && (size_t) n < sizeof(res->fpr) - 1)
+            {
+                res->fpr[n] = (u_char) p[n];
+                n++;
+            }
+            res->fpr[n] = '\0';
+            res->fpr_len = (size_t) n;
+            if (n >= 32) {                      /* reject empty/short fpr */
+                good = 1;
+            }
+
+        } else if (ngx_strncmp(p, "REVKEYSIG", 9) == 0     /* revoked key   */
+                   || ngx_strncmp(p, "EXPKEYSIG", 9) == 0  /* expired key   */
+                   || ngx_strncmp(p, "EXPSIG", 6) == 0     /* expired sig   */
+                   || ngx_strncmp(p, "BADSIG", 6) == 0     /* bad signature */
+                   || ngx_strncmp(p, "ERRSIG", 6) == 0)    /* verify error  */
         {
-            res->fpr[n] = (u_char) p[n];
-            n++;
+            bad = 1;
         }
-        res->fpr[n] = '\0';
-        res->fpr_len = (size_t) n;
-        res->valid = 1;
-        break;
+    }
+
+    res->valid = (good && !bad) ? 1 : 0;
+    if (!res->valid) {
+        res->fpr_len = 0;
     }
 
     if (!res->valid) {
