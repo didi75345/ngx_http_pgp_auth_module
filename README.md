@@ -30,8 +30,14 @@ they only need to share one secret (`pgp_session_secret`).
 | `pgp_auth` | `off` | Enable PGP auth for this location. |
 | `pgp_keyring` | `/etc/nginx/pubkeys.gpg` | Public keyring of allowed signers (absolute path). |
 | `pgp_session_secret` | *(random)* | File with the HMAC secret. **Set this** for multi-node / restart-stable sessions. |
-| `pgp_challenge_timeout` | `300s` | How long an issued challenge stays valid. |
-| `pgp_session_timeout` | `24h` | Re-challenge interval. `0` = unlimited. |
+| `pgp_challenge_timeout` | `120s` | How long an issued challenge stays valid. |
+| `pgp_session_timeout` | `1h` | Re-challenge interval. `0` = unlimited. |
+| `pgp_session_cookie_secure` | `on` | Add `; Secure` to the session cookie (set `off` only for plain-HTTP testing). |
+| `pgp_auth_bind_client_ip` | `on` | Fold the client IP into the token, blocking cross-IP replay. Behind a proxy, configure `ngx_http_realip_module`. |
+| `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
+| `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |
+| `pgp_auth_nonce_storage_address` | — | `host:port` of the Redis server (required for `redis`). |
+| `pgp_revocation_list` | — | File of revoked key fingerprints (one per line). Revokes the key and its live sessions; re-read on change, no reload. |
 
 All directives are valid at `http`, `server`, and `location` scope.
 

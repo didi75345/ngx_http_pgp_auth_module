@@ -36,6 +36,32 @@ Everything else (the keyring, the secret) is operator-controlled.
   under a hard timeout that SIGKILLs a stuck gpg so a worker can never hang.
 - **SIGCHLD-safe.** The gpg child is reaped by the module without racing
   nginx's own SIGCHLD handling.
+- **Secure cookies over TLS.** The session cookie is set with `HttpOnly` and
+  `SameSite=Lax` always, and `Secure` whenever the login arrived over TLS.
+- **Rate-limitable logins.** Each login attempt forks a gpg verification, so
+  submissions should be capped with nginx's own `limit_req` keyed on the
+  `__pgp_auth` argument — see `examples/nginx.conf` for the exact pattern.
+  Combined with the 5s gpg timeout this bounds the work an attacker can cause.
+
+## Hardening from the security review
+
+- **Challenge bound to the signed plaintext.** gpg is run with `--output` and
+  the challenge is checked *only* inside the bytes gpg actually verified, so a
+  real signature over other text with a challenge appended/prepended outside
+  the signature is rejected.
+- **Hardened gpg status parse.** Status is read on a pipe separate from stderr;
+  only lines with the exact `[GNUPG:] ` prefix are trusted; short fingerprints
+  are rejected; and `REVKEYSIG` / `EXPKEYSIG` / `EXPSIG` / `BADSIG` / `ERRSIG`
+  fail the verification.
+- **Single-use challenges** (`pgp_auth_nonce_storage`): a shared-memory or Redis
+  seen-nonce store closes the replay-within-validity window. Fails closed.
+- **Client binding** (`pgp_auth_bind_client_ip`, `pgp_auth_bind_user_agent`,
+  both on): the client IP and User-Agent are folded into the token, so a stolen
+  challenge or session cookie will not validate from another client.
+- **Secure cookie** (`pgp_session_cookie_secure`, on) and shorter default
+  challenge/session lifetimes to shrink the replay window and blast radius.
+- **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
+  and all of its live sessions without rotating the secret or reloading nginx.
 
 ## Verification
 

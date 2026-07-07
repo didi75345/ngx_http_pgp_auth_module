@@ -31,12 +31,14 @@
 #include <openssl/crypto.h>
 
 #include "ngx_http_pgp_auth_gpg.h"
+#include "ngx_http_pgp_auth_nonce.h"
 
 
 #define NGX_HTTP_PGP_COOKIE       "pgp_session"
 #define NGX_HTTP_PGP_AUTH_ARG     "__pgp_auth"
 #define NGX_HTTP_PGP_FIELD        "signed"
 #define NGX_HTTP_PGP_NONCE_LEN    16          /* raw bytes -> 32 hex chars */
+#define NGX_HTTP_PGP_NONCE_ZONE_SIZE  (8 * 1024 * 1024)
 
 
 typedef struct {
@@ -45,16 +47,33 @@ typedef struct {
     time_t       challenge_timeout;   /* seconds a challenge stays valid    */
     time_t       session_timeout;     /* seconds; 0 == unlimited            */
     ngx_flag_t   cookie_secure;       /* add "; Secure" to the cookie       */
+    ngx_flag_t   bind_ip;             /* mix client IP into the HMAC        */
+    ngx_flag_t   bind_ua;             /* mix User-Agent into the HMAC       */
+    ngx_uint_t   nonce_storage;       /* none | memory | redis              */
+    ngx_shm_zone_t *nonce_zone;       /* shared zone for the memory backend */
+    ngx_str_t    nonce_addr;          /* redis host:port                    */
+    ngx_str_t    revocation_list;     /* path: revoked key fingerprints     */
+    time_t       revoc_mtime;         /* cached file mtime (per worker)     */
+    ngx_str_t    revoc_cache;         /* cached file contents (per worker)  */
     ngx_str_t    secret_file;
     ngx_str_t    secret;              /* loaded HMAC secret bytes           */
 } ngx_http_pgp_auth_loc_conf_t;
+
+
+static ngx_conf_enum_t  ngx_http_pgp_nonce_storage_enum[] = {
+    { ngx_string("none"),   NGX_HTTP_PGP_NONCE_NONE },
+    { ngx_string("memory"), NGX_HTTP_PGP_NONCE_MEMORY },
+    { ngx_string("redis"),  NGX_HTTP_PGP_NONCE_REDIS },
+    { ngx_null_string, 0 }
+};
 
 
 static ngx_int_t ngx_http_pgp_auth_handler(ngx_http_request_t *r);
 static void ngx_http_pgp_auth_submit(ngx_http_request_t *r);
 
 static ngx_int_t ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
-    ngx_str_t *secret, u_char *data, size_t len, ngx_str_t *out);
+    ngx_http_pgp_auth_loc_conf_t *plcf, u_char *data, size_t len,
+    ngx_str_t *out);
 static ngx_int_t ngx_http_pgp_ct_eq(ngx_str_t *a, ngx_str_t *b);
 
 static ngx_int_t ngx_http_pgp_check_session(ngx_http_request_t *r,
@@ -116,6 +135,41 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       offsetof(ngx_http_pgp_auth_loc_conf_t, cookie_secure),
       NULL },
 
+    { ngx_string("pgp_auth_bind_client_ip"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, bind_ip),
+      NULL },
+
+    { ngx_string("pgp_auth_bind_user_agent"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, bind_ua),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_storage),
+      &ngx_http_pgp_nonce_storage_enum },
+
+    { ngx_string("pgp_auth_nonce_storage_address"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_addr),
+      NULL },
+
+    { ngx_string("pgp_revocation_list"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, revocation_list),
+      NULL },
+
       ngx_null_command
 };
 
@@ -151,18 +205,64 @@ ngx_module_t  ngx_http_pgp_auth_module = {
 };
 
 
-/* HMAC-SHA256(secret, data) hex-encoded into out (allocated from r->pool). */
+/*
+ * HMAC-SHA256(secret, data [|| client binding]) hex-encoded into out.
+ *
+ * When pgp_auth_bind_client_ip / pgp_auth_bind_user_agent are on, the client's
+ * IP and/or User-Agent are folded into the MAC input. Because the same request
+ * attributes are present when a challenge is issued and when it (or a session)
+ * is verified, a token lifted to a different client no longer validates -- it
+ * blocks cross-client replay of both challenges and session cookies. The bound
+ * values are NOT carried in the token; they are re-derived from the request.
+ *
+ * NOTE: behind a reverse proxy the client IP nginx sees is the proxy's unless
+ * ngx_http_realip_module is configured; see SECURITY.md.
+ */
 static ngx_int_t
-ngx_http_pgp_hmac_hex(ngx_http_request_t *r, ngx_str_t *secret,
-    u_char *data, size_t len, ngx_str_t *out)
+ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, u_char *data, size_t len,
+    ngx_str_t *out)
 {
     unsigned int   mdlen;
     unsigned char  md[EVP_MAX_MD_SIZE];
+    ngx_str_t      ip, ua;
+    u_char        *buf, *b;
+    size_t         total;
 
-    if (HMAC(EVP_sha256(), secret->data, (int) secret->len, data, len,
-             md, &mdlen) == NULL)
-    {
-        return NGX_ERROR;
+    ngx_str_null(&ip);
+    ngx_str_null(&ua);
+
+    if (plcf->bind_ip) {
+        ip = r->connection->addr_text;
+    }
+    if (plcf->bind_ua && r->headers_in.user_agent != NULL) {
+        ua = r->headers_in.user_agent->value;
+    }
+
+    if (ip.len == 0 && ua.len == 0) {
+        if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
+                 data, len, md, &mdlen) == NULL)
+        {
+            return NGX_ERROR;
+        }
+    } else {
+        /* data || 0x1e || ip || 0x1e || ua */
+        total = len + 1 + ip.len + 1 + ua.len;
+        buf = ngx_pnalloc(r->pool, total);
+        if (buf == NULL) {
+            return NGX_ERROR;
+        }
+        b = ngx_cpymem(buf, data, len);
+        *b++ = 0x1e;
+        b = ngx_cpymem(b, ip.data, ip.len);
+        *b++ = 0x1e;
+        b = ngx_cpymem(b, ua.data, ua.len);
+
+        if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
+                 buf, total, md, &mdlen) == NULL)
+        {
+            return NGX_ERROR;
+        }
     }
 
     out->data = ngx_pnalloc(r->pool, mdlen * 2);
@@ -173,6 +273,92 @@ ngx_http_pgp_hmac_hex(ngx_http_request_t *r, ngx_str_t *secret,
     out->len = mdlen * 2;
 
     return NGX_OK;
+}
+
+
+/*
+ * Is `fpr` listed in the revocation file? The file holds one key fingerprint
+ * per line (# comments and blank lines ignored); case-insensitive. The file is
+ * re-read only when its mtime changes, so an operator can revoke a key (or all
+ * of that key's live sessions -- the session cookie carries the fpr) simply by
+ * appending to the file, with no nginx reload. Cache is per worker.
+ */
+static ngx_int_t
+ngx_http_pgp_is_revoked(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_str_t *fpr)
+{
+    u_char           *buf, *line, *nl, *end, *s, *e;
+    ssize_t           n;
+    size_t            sz;
+    ngx_fd_t          fd;
+    ngx_file_info_t   fi;
+
+    if (plcf->revocation_list.len == 0 || fpr->len == 0) {
+        return 0;
+    }
+
+    if (ngx_file_info(plcf->revocation_list.data, &fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "pgp_auth: cannot stat revocation list \"%V\"",
+                      &plcf->revocation_list);
+        return 0;                               /* fail open: no list usable */
+    }
+
+    /* (re)load only when the file changed */
+    if (plcf->revoc_cache.data == NULL
+        || ngx_file_mtime(&fi) != plcf->revoc_mtime)
+    {
+        fd = ngx_open_file(plcf->revocation_list.data, NGX_FILE_RDONLY,
+                           NGX_FILE_OPEN, 0);
+        if (fd == NGX_INVALID_FILE) {
+            return 0;
+        }
+        sz = (size_t) ngx_file_size(&fi);
+        buf = ngx_alloc(sz + 1, r->connection->log);
+        if (buf == NULL) {
+            ngx_close_file(fd);
+            return 0;
+        }
+        n = ngx_read_fd(fd, buf, sz);
+        ngx_close_file(fd);
+        if (n < 0) {
+            ngx_free(buf);
+            return 0;
+        }
+        buf[n] = '\0';
+
+        if (plcf->revoc_cache.data != NULL) {
+            ngx_free(plcf->revoc_cache.data);
+        }
+        plcf->revoc_cache.data = buf;
+        plcf->revoc_cache.len = (size_t) n;
+        plcf->revoc_mtime = ngx_file_mtime(&fi);
+    }
+
+    /* scan lines, trim, skip comments, compare case-insensitively */
+    line = plcf->revoc_cache.data;
+    end = line + plcf->revoc_cache.len;
+
+    while (line < end) {
+        nl = ngx_strlchr(line, end, '\n');
+        if (nl == NULL) {
+            nl = end;
+        }
+        s = line;
+        e = nl;
+        while (s < e && (*s == ' ' || *s == '\t')) { s++; }
+        while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) { e--; }
+
+        if (s < e && *s != '#'
+            && (size_t) (e - s) == fpr->len
+            && ngx_strncasecmp(s, fpr->data, fpr->len) == 0)
+        {
+            return 1;
+        }
+        line = nl + 1;
+    }
+
+    return 0;
 }
 
 
@@ -251,7 +437,7 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
     mac_have.data = sep2 + 1;
     mac_have.len = last - (sep2 + 1);
 
-    if (ngx_http_pgp_hmac_hex(r, &plcf->secret, payload.data, payload.len,
+    if (ngx_http_pgp_hmac_hex(r, plcf, payload.data, payload.len,
                               &mac_want) != NGX_OK)
     {
         return NGX_DECLINED;
@@ -264,6 +450,15 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
     exp = ngx_atotm(p, sep1 - p);
     if (exp != 0 && exp < ngx_time()) {
         return NGX_DECLINED;                   /* expired */
+    }
+
+    /* revoked key -> revoke every session it holds (cookie carries the fpr) */
+    payload.data = sep1 + 1;
+    payload.len = sep2 - (sep1 + 1);           /* fpr */
+    if (ngx_http_pgp_is_revoked(r, plcf, &payload)) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: session key revoked");
+        return NGX_DECLINED;
     }
 
     return NGX_OK;
@@ -298,6 +493,14 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
     if (!vr.valid) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: signature not from a keyring key");
+        return NGX_DECLINED;
+    }
+
+    fpr.data = vr.fpr;
+    fpr.len = vr.fpr_len;
+    if (ngx_http_pgp_is_revoked(r, plcf, &fpr)) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: signing key is revoked");
         return NGX_DECLINED;
     }
 
@@ -336,7 +539,7 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
     mac_have.data = s3 + 1;
     mac_have.len = line_end - (s3 + 1);
 
-    if (ngx_http_pgp_hmac_hex(r, &plcf->secret, payload.data, payload.len,
+    if (ngx_http_pgp_hmac_hex(r, plcf, payload.data, payload.len,
                               &mac_want) != NGX_OK)
     {
         return NGX_ERROR;
@@ -352,6 +555,32 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: challenge expired");
         return NGX_DECLINED;
+    }
+
+    /*
+     * Single-use enforcement: record this challenge's nonce and reject if it
+     * was already used. Fails closed (rejects) if the backend errors, so a
+     * misconfigured/unreachable store never silently disables replay defence.
+     */
+    {
+        ngx_str_t  nonce;
+        ngx_int_t  rc;
+
+        nonce.data = s2 + 1;
+        nonce.len = s3 - (s2 + 1);
+
+        rc = ngx_http_pgp_nonce_check_and_set(r, plcf->nonce_storage,
+                 plcf->nonce_zone, &plcf->nonce_addr, &nonce, exp);
+        if (rc == NGX_DECLINED) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "pgp_auth: challenge already used (replay)");
+            return NGX_DECLINED;
+        }
+        if (rc != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "pgp_auth: nonce store error; rejecting");
+            return NGX_DECLINED;
+        }
     }
 
     fpr.data = vr.fpr;
@@ -380,7 +609,7 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     }
     plen = ngx_sprintf(payload, "%T|%V", exp, fpr) - payload;
 
-    if (ngx_http_pgp_hmac_hex(r, &plcf->secret, payload, plen, &mac) != NGX_OK) {
+    if (ngx_http_pgp_hmac_hex(r, plcf, payload, plen, &mac) != NGX_OK) {
         return NGX_ERROR;
     }
 
@@ -463,7 +692,7 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
     plen = ngx_sprintf(payload, "v1|%T|%*s", exp,
                        sizeof(nonce_hex), nonce_hex) - payload;
 
-    if (ngx_http_pgp_hmac_hex(r, &plcf->secret, payload, plen, &mac)
+    if (ngx_http_pgp_hmac_hex(r, plcf, payload, plen, &mac)
         != NGX_OK)
     {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -731,6 +960,9 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->challenge_timeout = NGX_CONF_UNSET;
     conf->session_timeout = NGX_CONF_UNSET;
     conf->cookie_secure = NGX_CONF_UNSET;
+    conf->bind_ip = NGX_CONF_UNSET;
+    conf->bind_ua = NGX_CONF_UNSET;
+    conf->nonce_storage = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -804,6 +1036,12 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_sec_value(conf->session_timeout, prev->session_timeout,
                              3600);
     ngx_conf_merge_value(conf->cookie_secure, prev->cookie_secure, 1);
+    ngx_conf_merge_value(conf->bind_ip, prev->bind_ip, 1);
+    ngx_conf_merge_value(conf->bind_ua, prev->bind_ua, 1);
+    ngx_conf_merge_uint_value(conf->nonce_storage, prev->nonce_storage,
+                              NGX_HTTP_PGP_NONCE_MEMORY);
+    ngx_conf_merge_str_value(conf->nonce_addr, prev->nonce_addr, "");
+    ngx_conf_merge_str_value(conf->revocation_list, prev->revocation_list, "");
     ngx_conf_merge_str_value(conf->secret_file, prev->secret_file, "");
 
     if (!conf->enable) {
@@ -814,6 +1052,22 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->keyring.len == 0 || conf->keyring.data[0] != '/') {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "pgp_auth: pgp_keyring must be an absolute path");
+        return NGX_CONF_ERROR;
+    }
+
+    if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_MEMORY) {
+        conf->nonce_zone = prev->nonce_zone
+            ? prev->nonce_zone
+            : ngx_http_pgp_nonce_add_zone(cf, NGX_HTTP_PGP_NONCE_ZONE_SIZE);
+        if (conf->nonce_zone == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_REDIS
+               && conf->nonce_addr.len == 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "pgp_auth: pgp_auth_nonce_storage_address is required for redis");
         return NGX_CONF_ERROR;
     }
 
