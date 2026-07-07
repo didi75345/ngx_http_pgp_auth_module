@@ -60,6 +60,10 @@ export GNUPGHOME="$WORK/gpg"
 head -c 48 /dev/urandom | base64 > "$WORK/session.key"
 echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 
+# revocation list containing the test key's fingerprint (for the /revoc/ test)
+gpg --list-keys --with-colons test@example.com \
+    | awk -F: '/^fpr:/{print $10; exit}' > "$WORK/revoked.txt"
+
 # --- nginx config ------------------------------------------------------------
 {
     [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
@@ -90,6 +94,13 @@ http {
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_challenge_timeout 1s;
+            root $WORK/html;
+        }
+        location /revoc/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked.txt;
             root $WORK/html;
         }
     }
@@ -182,6 +193,29 @@ curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/prepend.txt
      -D "$WORK/h3c" -o /dev/null >/dev/null
 grep -qi '^set-cookie:' "$WORK/h3c" && bad "challenge prepended outside signature rejected" \
     || ok "challenge prepended outside signature rejected"
+
+# Single-use: the same signed challenge must not work twice (default memory
+# nonce store). First submit succeeds; the replay must be rejected.
+curl -s "$base/" -o "$WORK/rp" >/dev/null
+RCH="$(challenge "$WORK/rp")"
+printf '%s' "$RCH" | gpg --clearsign --batch > "$WORK/replay.asc" 2>/dev/null
+R1=$(curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" \
+         --data-urlencode "signed@$WORK/replay.asc" -w '%{http_code}')
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/replay.asc" \
+     -D "$WORK/hr" -o /dev/null >/dev/null
+{ [ "$R1" = 303 ] && ! grep -qi '^set-cookie:' "$WORK/hr"; } \
+    && ok "replay of a used challenge rejected (single-use)" \
+    || bad "replay rejected (first=$R1)"
+
+# Revocation: the /revoc/ location lists the test key's fingerprint as revoked,
+# so a valid login there must be rejected.
+curl -s "$base/revoc/" -o "$WORK/vp" >/dev/null
+VCH="$(challenge "$WORK/vp")"
+printf '%s' "$VCH" | gpg --clearsign --batch > "$WORK/vs.asc" 2>/dev/null
+curl -s -X POST "$base/revoc/?__pgp_auth=1" --data-urlencode "signed@$WORK/vs.asc" \
+     -D "$WORK/hv" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hv" && bad "revoked key rejected" \
+    || ok "revoked key rejected"
 
 curl -s "$base/short/" -o "$WORK/sp" >/dev/null
 CHS="$(challenge "$WORK/sp")"

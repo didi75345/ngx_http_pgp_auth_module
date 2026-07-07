@@ -56,8 +56,11 @@ error_log $WORK/logs/e.log info; pid $WORK/logs/p.pid;
 events { worker_connections 64; }
 http { server { listen 8931; location / {
   pgp_auth on; pgp_keyring $WORK/pubkeys.gpg; pgp_session_secret $WORK/session.key;
+  pgp_revocation_list $WORK/revoked.txt;
   root $WORK/html; index index.html; } } }
 EOF
+# exercise the revocation file-read + client-binding + memory-nonce paths too
+printf '# revoked keys\nAAAABBBBCCCCDDDDEEEEFFFF0000111122223333\n' > "$WORK/revoked.txt"
 
 # detect_odr_violation=0: a dynamic module duplicates ngx_module_names, which is
 # a sanitizer artifact of dynamic linking, not a real fault.
@@ -80,6 +83,10 @@ curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" \
      -H 'Content-Type: application/x-www-form-urlencoded' --data-binary 'signed=%ZZ%%%'
 curl -s -o /dev/null -H 'Cookie: pgp_session=1|2|3' "$base/"
 curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/huge"
+# valid login twice: exercises client-binding, memory-nonce insert+replay,
+# and the revocation file read (both fresh and mtime-cached)
+curl -s -o /dev/null -A Sanitizer -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/s.asc"
+curl -s -o /dev/null -A Sanitizer -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/s.asc"
 
 sleep 1
 kill "$NGPID" 2>/dev/null; NGPID=
