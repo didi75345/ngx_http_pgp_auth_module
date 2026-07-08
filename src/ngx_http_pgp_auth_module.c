@@ -35,6 +35,7 @@
 
 
 #define NGX_HTTP_PGP_COOKIE       "pgp_session"
+#define NGX_HTTP_PGP_COOKIE_HOST  "__Host-pgp_session"
 #define NGX_HTTP_PGP_AUTH_ARG     "__pgp_auth"
 #define NGX_HTTP_PGP_FIELD        "signed"
 #define NGX_HTTP_PGP_NONCE_LEN    16          /* raw bytes -> 32 hex chars */
@@ -47,6 +48,7 @@ typedef struct {
     time_t       challenge_timeout;   /* seconds a challenge stays valid    */
     time_t       session_timeout;     /* seconds; 0 == unlimited            */
     ngx_flag_t   cookie_secure;       /* add "; Secure" to the cookie       */
+    ngx_flag_t   cookie_host_prefix;  /* use the __Host- cookie name prefix */
     ngx_flag_t   bind_ip;             /* mix client IP into the HMAC        */
     ngx_flag_t   bind_ua;             /* mix User-Agent into the HMAC       */
     ngx_uint_t   nonce_storage;       /* none | memory | redis              */
@@ -133,6 +135,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, cookie_secure),
+      NULL },
+
+    { ngx_string("pgp_session_cookie_host_prefix"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, cookie_host_prefix),
       NULL },
 
     { ngx_string("pgp_auth_bind_client_ip"),
@@ -374,6 +383,24 @@ ngx_http_pgp_ct_eq(ngx_str_t *a, ngx_str_t *b)
 
 
 /*
+ * Session cookie name. The __Host- prefix is used only when it is enabled AND
+ * the cookie is Secure, because the prefix mandates Secure + Path=/ + no Domain
+ * -- browsers reject a __Host- cookie without them. So a Tor-hidden-service
+ * setup that runs plain HTTP (pgp_session_cookie_secure off) automatically
+ * falls back to the plain name instead of emitting a cookie that gets dropped.
+ */
+static void
+ngx_http_pgp_cookie_name(ngx_http_pgp_auth_loc_conf_t *plcf, ngx_str_t *name)
+{
+    if (plcf->cookie_host_prefix && plcf->cookie_secure) {
+        ngx_str_set(name, NGX_HTTP_PGP_COOKIE_HOST);
+    } else {
+        ngx_str_set(name, NGX_HTTP_PGP_COOKIE);
+    }
+}
+
+
+/*
  * Look up a cookie by name. nginx 1.23.0 changed cookie storage from an array
  * to a linked list and reworked ngx_http_parse_multi_header_lines(), so this
  * shim keeps the module building on both Debian Bookworm (1.22) and Trixie
@@ -412,7 +439,7 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
     u_char      *p, *last, *sep1, *sep2;
     ngx_str_t    cookie, name, payload, mac_have, mac_want;
 
-    ngx_str_set(&name, NGX_HTTP_PGP_COOKIE);
+    ngx_http_pgp_cookie_name(plcf, &name);
 
     if (ngx_http_pgp_get_cookie(r, &name, &cookie) != NGX_OK) {
         return NGX_DECLINED;
@@ -597,7 +624,7 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     time_t            exp;
     u_char           *payload;
     size_t            plen;
-    ngx_str_t         mac;
+    ngx_str_t         mac, name;
     ngx_table_elt_t  *set_cookie;
 
     exp = (plcf->session_timeout == 0) ? 0 : ngx_time() + plcf->session_timeout;
@@ -620,16 +647,22 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     set_cookie->hash = 1;
     ngx_str_set(&set_cookie->key, "Set-Cookie");
 
-    /* Secure flag controlled by pgp_session_cookie_secure (default on). */
+    ngx_http_pgp_cookie_name(plcf, &name);
+
+    /*
+     * Secure flag from pgp_session_cookie_secure (default on); cookie name may
+     * carry the __Host- prefix. __Host- requires Secure + Path=/ + no Domain,
+     * all of which hold whenever the prefixed name is chosen.
+     */
     set_cookie->value.data = ngx_pnalloc(r->pool,
-        sizeof(NGX_HTTP_PGP_COOKIE "=") - 1 + plen + 1 + mac.len
+        name.len + 1 + plen + 1 + mac.len
         + sizeof("; Path=/; HttpOnly; SameSite=Lax; Secure") - 1);
     if (set_cookie->value.data == NULL) {
         return NGX_ERROR;
     }
     set_cookie->value.len = ngx_sprintf(set_cookie->value.data,
-        "%s=%*s|%V; Path=/; HttpOnly; SameSite=Lax%s",
-        NGX_HTTP_PGP_COOKIE, plen, payload, &mac,
+        "%V=%*s|%V; Path=/; HttpOnly; SameSite=Lax%s",
+        &name, plen, payload, &mac,
         plcf->cookie_secure ? "; Secure" : "")
         - set_cookie->value.data;
 
@@ -960,6 +993,7 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->challenge_timeout = NGX_CONF_UNSET;
     conf->session_timeout = NGX_CONF_UNSET;
     conf->cookie_secure = NGX_CONF_UNSET;
+    conf->cookie_host_prefix = NGX_CONF_UNSET;
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
@@ -1036,6 +1070,7 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_sec_value(conf->session_timeout, prev->session_timeout,
                              3600);
     ngx_conf_merge_value(conf->cookie_secure, prev->cookie_secure, 1);
+    ngx_conf_merge_value(conf->cookie_host_prefix, prev->cookie_host_prefix, 1);
     ngx_conf_merge_value(conf->bind_ip, prev->bind_ip, 1);
     ngx_conf_merge_value(conf->bind_ua, prev->bind_ua, 1);
     ngx_conf_merge_uint_value(conf->nonce_storage, prev->nonce_storage,

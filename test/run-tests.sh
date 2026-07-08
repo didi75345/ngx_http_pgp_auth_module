@@ -126,7 +126,7 @@ printf '%s' "$CH" | gpg --clearsign --batch > "$WORK/s.asc" 2>/dev/null
 
 curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/s.asc" \
      -D "$WORK/h1" -o /dev/null -w '%{http_code}' > "$WORK/c2"
-[ "$(cat "$WORK/c2")" = 303 ] && grep -qi '^set-cookie: pgp_session=' "$WORK/h1" \
+[ "$(cat "$WORK/c2")" = 303 ] && grep -qi 'set-cookie:.*pgp_session=' "$WORK/h1" \
     && ok "valid signature returns 303 + session cookie" || bad "valid sign-in"
 
 CK="$(grep -i '^set-cookie:' "$WORK/h1" | sed 's/[Ss]et-[Cc]ookie: //;s/;.*//' | tr -d '\r')"
