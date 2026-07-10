@@ -64,6 +64,16 @@ Everything else (the keyring, the secret) is operator-controlled.
   challenge/session lifetimes to shrink the replay window and blast radius.
 - **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
   and all of its live sessions without rotating the secret or reloading nginx.
+  An unreadable list **fails closed** (denies) by default
+  (`pgp_revocation_fail_open off`).
+- **DoS resistance on the login endpoint** (unauthenticated): a body larger than
+  `pgp_auth_max_body_size` (16k) is rejected before it is read; a submission
+  that is not a clear-signed block is rejected *before* gpg is forked; and each
+  gpg verification is bounded by `pgp_gpg_timeout` (2s). Deployments should also
+  put `limit_req` in front of the login submission (see `examples/nginx.conf`).
+- **No trust in truncated gpg output**: if gpg's status or output overflows the
+  read buffer it is treated as a failure, so a later `BADSIG`/`REVKEYSIG` marker
+  cannot be lost past a `VALIDSIG`.
 
 ## Verification
 
