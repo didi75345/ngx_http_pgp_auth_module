@@ -265,7 +265,7 @@ ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
         *b++ = 0x1e;
         b = ngx_cpymem(b, ip.data, ip.len);
         *b++ = 0x1e;
-        b = ngx_cpymem(b, ua.data, ua.len);
+        ngx_memcpy(b, ua.data, ua.len);
 
         if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
                  buf, total, md, &mdlen) == NULL)
