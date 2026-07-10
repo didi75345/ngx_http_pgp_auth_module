@@ -83,22 +83,30 @@ use-after-free, and bad memory access. The module reports **no faults** on any
 input. (Run `sh test/sanitize.sh`; it builds, exercises, and checks the
 sanitizer output, exiting non-zero on any fault in the module.)
 
-**Static analysis** (`test/analyze.sh`): the sources are run through GCC's
-`-fanalyzer` — **no findings**. Both this and the sanitizers run in CI.
+**Static analysis**: GCC's `-fanalyzer` (`test/analyze.sh`) and `cppcheck
+--enable=all` — **no error/warning-level findings** in the module sources.
+
+**Valgrind** (`test/memcheck.sh`): the module is exercised under Valgrind
+memcheck — **no invalid read/write, no use of uninitialised memory, and no
+leaks** originating in the module (only nginx's own framework allocations
+appear, which it manages itself).
 
 ### Memory-safety coverage
 
+Every class is checked by at least two independent tools that have been run
+against the code:
+
 | Class | Verified by |
 |-------|-------------|
-| Buffer overflow, out-of-bounds read/write | ASan + `-fanalyzer` |
-| Use-after-free | ASan + `-Wanalyzer-use-after-free` |
+| Buffer overflow, out-of-bounds read/write | ASan + cppcheck + `-fanalyzer` |
+| Use-after-free | ASan + Valgrind + `-Wanalyzer-use-after-free` |
 | Double free | ASan + `-Wanalyzer-double-free` |
-| Null-pointer dereference | ASan/UBSan + `-Wanalyzer-null-dereference` |
-| Integer overflow | UBSan |
+| Null-pointer dereference | ASan/UBSan + cppcheck + `-Wanalyzer-null-dereference` |
+| Integer overflow | UBSan + cppcheck |
 | Stack overflow (stack-buffer-overflow) | ASan |
-| Memory leak | ASan leak check + `-Wanalyzer-malloc-leak` |
-| Uninitialized memory | `-fanalyzer` |
-| Format-string | `-Wformat` under `-Werror` |
+| Memory leak | ASan leak check + Valgrind + `-Wanalyzer-malloc-leak` |
+| Uninitialized memory | Valgrind memcheck + `-fanalyzer` |
+| Format-string | `-Wformat` under `-Werror` + cppcheck |
 
 ## Reporting
 
