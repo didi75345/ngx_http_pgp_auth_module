@@ -1099,6 +1099,21 @@ ngx_http_pgp_load_secret(ngx_conf_t *cf, ngx_str_t *path, ngx_str_t *out)
         return NGX_ERROR;
     }
 
+    /*
+     * The secret forges both sessions and challenges, so a leak is a full auth
+     * bypass. Warn (like sshd does for private keys) if the file is readable by
+     * group or others -- config-time only, no hot-path cost.
+     */
+    if (ngx_file_access(&fi) & 0077) {
+        ngx_uint_t  m = (ngx_uint_t) (ngx_file_access(&fi) & 0777);
+
+        /* nginx's printf has no %o, so render the octal digits ourselves */
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "pgp_auth: secret file \"%V\" is group/world-accessible "
+            "(mode 0%ui%ui%ui); restrict it to the nginx user (chmod 600)",
+            path, (m >> 6) & 7, (m >> 3) & 7, m & 7);
+    }
+
     buf = ngx_pnalloc(cf->pool, (size_t) ngx_file_size(&fi));
     if (buf == NULL) {
         ngx_close_file(fd);

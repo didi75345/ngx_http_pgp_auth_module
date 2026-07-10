@@ -57,7 +57,7 @@ EOF
 gpg --batch --gen-key "$WORK/kp2" >/dev/null 2>&1
 export GNUPGHOME="$WORK/gpg"
 
-head -c 48 /dev/urandom | base64 > "$WORK/session.key"
+head -c 48 /dev/urandom | base64 > "$WORK/session.key"; chmod 600 "$WORK/session.key"
 echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 
 # revocation list containing the test key's fingerprint (for the /revoc/ test)
