@@ -268,6 +268,49 @@ curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode 'signed=not a pgp message
 grep -qi '^set-cookie:' "$WORK/h5" && bad "garbage body rejected" \
     || ok "garbage body rejected"
 
+# HTTP/2 login must still work: the body-size hardening keys on chunked
+# (HTTP/1.1) bodies, and must NOT reject a normal HTTP/2 submission (which
+# carries a Content-Length). Only runs if this nginx has http_v2 + we have
+# openssl and a curl with HTTP/2.
+if "$NGINX_BIN" -V 2>&1 | grep -q http_v2 \
+   && command -v openssl >/dev/null 2>&1 \
+   && curl --version | grep -qi HTTP2
+then
+    openssl req -x509 -newkey ed25519 -keyout "$WORK/k.pem" -out "$WORK/c.pem" \
+        -days 2 -nodes -subj "/CN=localhost" >/dev/null 2>&1
+    HP=$((PORT + 1))
+    {
+        echo "load_module $MODULE_SO;"
+        [ "$(id -u)" = 0 ] && echo "user root;"
+        cat <<EOF
+worker_processes 1; daemon off; error_log $WORK/logs/h2.log crit;
+pid $WORK/logs/h2.pid;
+events { worker_connections 64; }
+http { server {
+    listen $HP ssl; http2 on;
+    ssl_certificate $WORK/c.pem; ssl_certificate_key $WORK/k.pem;
+    location / {
+        pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+        pgp_session_secret $WORK/session.key; pgp_auth_nonce_storage none;
+        root $WORK/html; index index.html;
+    }
+} }
+EOF
+    } > "$WORK/conf/h2.conf"
+    "$NGINX_BIN" -p "$WORK" -c conf/h2.conf & sleep 1
+    hb="https://127.0.0.1:$HP"
+    curl -sk --http2 "$hb/" -o "$WORK/h2p"
+    hch="$(challenge "$WORK/h2p")"
+    printf '%s' "$hch" | gpg --clearsign --batch > "$WORK/h2s.asc" 2>/dev/null
+    hcode=$(curl -sk --http2 -o /dev/null -X POST "$hb/?__pgp_auth=1" \
+            --data-urlencode "signed@$WORK/h2s.asc" -w '%{http_version} %{http_code}')
+    [ "$hcode" = "2 303" ] && ok "HTTP/2 login succeeds (no chunked-cap regression)" \
+        || bad "HTTP/2 login (got '$hcode')"
+    [ -f "$WORK/logs/h2.pid" ] && kill "$(cat "$WORK/logs/h2.pid")" 2>/dev/null
+else
+    echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
+fi
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
