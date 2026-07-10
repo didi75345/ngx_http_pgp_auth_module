@@ -287,7 +287,7 @@ worker_processes 1; daemon off; error_log $WORK/logs/h2.log crit;
 pid $WORK/logs/h2.pid;
 events { worker_connections 64; }
 http { server {
-    listen $HP ssl; http2 on;
+    listen $HP ssl http2;
     ssl_certificate $WORK/c.pem; ssl_certificate_key $WORK/k.pem;
     location / {
         pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
