@@ -240,6 +240,14 @@ BC=$(curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" \
 [ "$BC" = 413 ] && ok "oversized auth body rejected (413)" \
     || bad "oversized body rejected (got $BC)"
 
+# The cap must also apply to a chunked (unknown-length) body, not just
+# Content-Length -- otherwise the size check is bypassed.
+CC=$(curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         -H 'Transfer-Encoding: chunked' --data-binary "@$WORK/big" -w '%{http_code}')
+[ "$CC" = 413 ] && ok "oversized chunked body rejected (413)" \
+    || bad "chunked body cap (got $CC)"
+
 # A non-PGP body is rejected without spawning gpg.
 curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode 'signed=plain junk, no armor' \
      -D "$WORK/hj" -o /dev/null >/dev/null

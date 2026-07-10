@@ -1010,14 +1010,19 @@ ngx_http_pgp_auth_handler(ngx_http_request_t *r)
     {
         /*
          * Reject an oversized auth body before reading it. A signed challenge
-         * is a few hundred bytes; capping this bounds the memory an
-         * unauthenticated client can make a worker buffer + hand to gpg.
+         * is a few hundred bytes; capping this bounds the work an
+         * unauthenticated client can make a worker do.
+         *
+         * A chunked body has content_length_n == -1 (unknown up front), which
+         * would bypass the size cap and let nginx buffer it (to disk) before we
+         * refuse it. Login submissions always carry a Content-Length, so we
+         * require one here and reject unknown-length bodies outright.
          */
-        if (r->headers_in.content_length_n
-            > (off_t) plcf->max_body_size)
+        if (r->headers_in.content_length_n < 0
+            || r->headers_in.content_length_n > (off_t) plcf->max_body_size)
         {
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "pgp_auth: auth body too large (%O > %uz)",
+                          "pgp_auth: auth body missing/too large (len=%O, cap=%uz)",
                           r->headers_in.content_length_n, plcf->max_body_size);
             return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
         }
