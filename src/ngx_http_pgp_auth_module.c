@@ -842,7 +842,7 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
 
 /* Collect the (in-memory or buffered) request body into one buffer. */
 static ngx_int_t
-ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body)
+ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body, size_t max)
 {
     size_t        len;
     u_char       *p;
@@ -864,6 +864,13 @@ ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body)
             return NGX_ERROR;
         }
         len += buf->last - buf->pos;
+    }
+
+    /* backstop for bodies whose length was unknown up front (e.g. HTTP/2) */
+    if (len > max) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: auth body too large (%uz > %uz)", len, max);
+        return NGX_ERROR;
     }
 
     body->data = ngx_pnalloc(r->pool, len + 1);
@@ -950,7 +957,7 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
      */
     r->keepalive = 0;
 
-    if (ngx_http_pgp_read_body(r, &body) != NGX_OK) {
+    if (ngx_http_pgp_read_body(r, &body, plcf->max_body_size) != NGX_OK) {
         ngx_http_finalize_request(r,
             ngx_http_pgp_send_challenge(r, plcf, 1));
         return;
@@ -1013,16 +1020,18 @@ ngx_http_pgp_auth_handler(ngx_http_request_t *r)
          * is a few hundred bytes; capping this bounds the work an
          * unauthenticated client can make a worker do.
          *
-         * A chunked body has content_length_n == -1 (unknown up front), which
-         * would bypass the size cap and let nginx buffer it (to disk) before we
-         * refuse it. Login submissions always carry a Content-Length, so we
-         * require one here and reject unknown-length bodies outright.
+         * Reject up front when the length is known and over the cap, and also
+         * for an HTTP/1.1 *chunked* body (content_length_n == -1) -- which would
+         * otherwise be buffered to disk before we could refuse it. We do NOT
+         * blanket-reject every unknown length: an HTTP/2 client may legitimately
+         * stream a body without declaring a length, so those fall through and
+         * are capped by size in the body handler below.
          */
-        if (r->headers_in.content_length_n < 0
-            || r->headers_in.content_length_n > (off_t) plcf->max_body_size)
+        if (r->headers_in.content_length_n > (off_t) plcf->max_body_size
+            || (r->headers_in.content_length_n < 0 && r->headers_in.chunked))
         {
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "pgp_auth: auth body missing/too large (len=%O, cap=%uz)",
+                          "pgp_auth: auth body too large/unbounded (len=%O, cap=%uz)",
                           r->headers_in.content_length_n, plcf->max_body_size);
             return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
         }
