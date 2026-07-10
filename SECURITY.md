@@ -17,7 +17,10 @@ Everything else (the keyring, the secret) is operator-controlled.
 
 - **No secrets on the server.** Only public keys live in the keyring; a server
   compromise leaks nothing that lets an attacker authenticate. Users' private
-  keys never reach the server.
+  keys never reach the server. The one sensitive file, `pgp_session_secret`
+  (it can forge both sessions and challenges), is checked at start-up: the
+  module logs a `warn` if it is group- or world-accessible (`mode & 077`),
+  the way sshd does for private keys.
 - **Stateless, HMAC-signed tokens.** Both the challenge and the session are
   authenticated with HMAC-SHA256 over a server secret. A client cannot forge a
   challenge the server did not issue, or a session it was not granted.

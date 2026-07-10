@@ -92,8 +92,13 @@ scripts/build-keyring.sh alice.asc bob.asc > /etc/nginx/pubkeys.gpg
 
 # 2. shared HMAC secret (same file on every node)
 scripts/gen-secret.sh > /etc/nginx/pgp_secret.key
-chmod 640 /etc/nginx/pgp_secret.key
+chown nginx /etc/nginx/pgp_secret.key   # the worker user
+chmod 600 /etc/nginx/pgp_secret.key
 ```
+
+The secret can forge both sessions and challenges, so keep it readable only by
+the nginx worker user (`chmod 600`). The module logs a `warn` at start-up if the
+file is group- or world-accessible.
 
 The **nginx worker user** (e.g. `www-data`/`nginx`) must be able to read both
 the keyring and the secret, and to write a throwaway directory under the system
