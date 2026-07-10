@@ -39,8 +39,14 @@ they only need to share one secret (`pgp_session_secret`).
 | `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |
 | `pgp_auth_nonce_storage_address` | — | `host:port` of the Redis server (required for `redis`). |
 | `pgp_revocation_list` | — | File of revoked key fingerprints (one per line). Revokes the key and its live sessions; re-read on change, no reload. |
+| `pgp_revocation_fail_open` | `off` | If the revocation list can't be read, `off` denies access (fail closed); `on` allows. |
+| `pgp_gpg_timeout` | `2s` | Max time for one gpg verification before it is killed. |
+| `pgp_auth_max_body_size` | `16k` | Reject a login body larger than this before reading it or spawning gpg. |
 
 All directives are valid at `http`, `server`, and `location` scope.
+
+Because the login endpoint is unauthenticated and each attempt spawns gpg,
+**rate-limit it** with nginx's `limit_req` — see `examples/nginx.conf`.
 
 ```nginx
 location / {

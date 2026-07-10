@@ -67,7 +67,8 @@ ngx_http_pgp_gpg_cleanup(const char *home, const char *msgpath)
 
 ngx_int_t
 ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
-    u_char *msg, size_t msg_len, ngx_http_pgp_verify_result_t *res)
+    u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
+    ngx_http_pgp_verify_result_t *res)
 {
     pid_t        pid;
     int          pfd[2], fd, status;
@@ -80,8 +81,10 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     char         out[8192];
     char        *p, *line, *save;
     int64_t      deadline;
-    ngx_int_t    good, bad;
+    ngx_int_t    good, bad, truncated;
     sigset_t     chld, prev;
+
+    truncated = 0;
 
     res->valid = 0;
     res->fpr_len = 0;
@@ -194,7 +197,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
      * is normally a few milliseconds, so a several-second cap is generous.
      */
     off = 0;
-    deadline = ngx_http_pgp_now_ms() + NGX_HTTP_PGP_GPG_TIMEOUT_MS;
+    deadline = ngx_http_pgp_now_ms() + (int64_t) timeout_ms;
     for ( ;; ) {
         int64_t        left = deadline - ngx_http_pgp_now_ms();
         struct pollfd  pe = { pfd[0], POLLIN, 0 };
@@ -225,6 +228,13 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         if (n > 0) {
             off += (size_t) n;
             if (off >= sizeof(out) - 1) {
+                /*
+                 * Status stream longer than our buffer: a later BADSIG /
+                 * REVKEYSIG marker could be cut off, so we must not trust a
+                 * VALIDSIG seen so far. Fail the verification.
+                 */
+                truncated = 1;
+                kill(pid, SIGKILL);
                 break;
             }
             continue;
@@ -256,6 +266,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
             if (n > 0) {
                 off += (size_t) n;
                 if (off >= sizeof(res->plaintext)) {
+                    truncated = 1;      /* signed content exceeds our buffer */
                     break;
                 }
                 continue;
@@ -314,7 +325,12 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         }
     }
 
-    res->valid = (good && !bad) ? 1 : 0;
+    if (truncated) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "pgp_auth: gpg output truncated; rejecting");
+    }
+
+    res->valid = (good && !bad && !truncated) ? 1 : 0;
     if (!res->valid) {
         res->fpr_len = 0;
     }

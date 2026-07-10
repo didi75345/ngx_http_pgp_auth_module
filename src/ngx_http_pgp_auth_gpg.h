@@ -38,6 +38,7 @@ typedef struct {
  * an internal failure.
  */
 ngx_int_t ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
-    u_char *msg, size_t msg_len, ngx_http_pgp_verify_result_t *res);
+    u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
+    ngx_http_pgp_verify_result_t *res);
 
 #endif /* NGX_HTTP_PGP_AUTH_GPG_H */

@@ -55,8 +55,11 @@ typedef struct {
     ngx_shm_zone_t *nonce_zone;       /* shared zone for the memory backend */
     ngx_str_t    nonce_addr;          /* redis host:port                    */
     ngx_str_t    revocation_list;     /* path: revoked key fingerprints     */
+    ngx_flag_t   revoc_fail_open;     /* on error, allow (1) or deny (0)    */
     time_t       revoc_mtime;         /* cached file mtime (per worker)     */
     ngx_str_t    revoc_cache;         /* cached file contents (per worker)  */
+    ngx_msec_t   gpg_timeout;         /* max ms for one gpg verify          */
+    size_t       max_body_size;       /* cap on the submitted auth body     */
     ngx_str_t    secret_file;
     ngx_str_t    secret;              /* loaded HMAC secret bytes           */
 } ngx_http_pgp_auth_loc_conf_t;
@@ -179,6 +182,27 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       offsetof(ngx_http_pgp_auth_loc_conf_t, revocation_list),
       NULL },
 
+    { ngx_string("pgp_revocation_fail_open"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, revoc_fail_open),
+      NULL },
+
+    { ngx_string("pgp_gpg_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, gpg_timeout),
+      NULL },
+
+    { ngx_string("pgp_auth_max_body_size"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, max_body_size),
+      NULL },
+
       ngx_null_command
 };
 
@@ -299,6 +323,7 @@ ngx_http_pgp_is_revoked(ngx_http_request_t *r,
     u_char           *buf, *line, *nl, *end, *s, *e;
     ssize_t           n;
     size_t            sz;
+    ngx_int_t         deny;
     ngx_fd_t          fd;
     ngx_file_info_t   fi;
 
@@ -306,11 +331,17 @@ ngx_http_pgp_is_revoked(ngx_http_request_t *r,
         return 0;
     }
 
+    /*
+     * A configured-but-unreadable revocation list must not silently disable
+     * revocation. Fail closed (deny) unless pgp_revocation_fail_open is set.
+     */
+    deny = plcf->revoc_fail_open ? 0 : 1;
+
     if (ngx_file_info(plcf->revocation_list.data, &fi) == NGX_FILE_ERROR) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                      "pgp_auth: cannot stat revocation list \"%V\"",
-                      &plcf->revocation_list);
-        return 0;                               /* fail open: no list usable */
+                      "pgp_auth: cannot stat revocation list \"%V\"%s",
+                      &plcf->revocation_list, deny ? " (failing closed)" : "");
+        return deny;
     }
 
     /* (re)load only when the file changed */
@@ -320,19 +351,19 @@ ngx_http_pgp_is_revoked(ngx_http_request_t *r,
         fd = ngx_open_file(plcf->revocation_list.data, NGX_FILE_RDONLY,
                            NGX_FILE_OPEN, 0);
         if (fd == NGX_INVALID_FILE) {
-            return 0;
+            return deny;
         }
         sz = (size_t) ngx_file_size(&fi);
         buf = ngx_alloc(sz + 1, r->connection->log);
         if (buf == NULL) {
             ngx_close_file(fd);
-            return 0;
+            return deny;
         }
         n = ngx_read_fd(fd, buf, sz);
         ngx_close_file(fd);
         if (n < 0) {
             ngx_free(buf);
-            return 0;
+            return deny;
         }
         buf[n] = '\0';
 
@@ -512,8 +543,20 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
      * Otherwise an attacker could take any message signed by a keyring key and
      * append/prepend a genuine challenge outside the signed region.
      */
+    /*
+     * Cheap pre-filter: only fork gpg for something that at least looks like a
+     * clear-signed block. Garbage submissions are rejected here, before the
+     * (blocking) gpg process is ever spawned -- important given this endpoint
+     * is unauthenticated. Pair with limit_req (see examples/nginx.conf).
+     */
+    if (ngx_strnstr(msg, "-----BEGIN PGP SIGNED MESSAGE-----", len) == NULL) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: submission is not a clear-signed message");
+        return NGX_DECLINED;
+    }
+
     if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->keyring, msg, len,
-                                &vr) != NGX_OK)
+                                plcf->gpg_timeout, &vr) != NGX_OK)
     {
         return NGX_ERROR;
     }
@@ -965,6 +1008,20 @@ ngx_http_pgp_auth_handler(ngx_http_request_t *r)
         && r->args.len
         && ngx_http_arg(r, arg.data, arg.len, &arg) == NGX_OK)
     {
+        /*
+         * Reject an oversized auth body before reading it. A signed challenge
+         * is a few hundred bytes; capping this bounds the memory an
+         * unauthenticated client can make a worker buffer + hand to gpg.
+         */
+        if (r->headers_in.content_length_n
+            > (off_t) plcf->max_body_size)
+        {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "pgp_auth: auth body too large (%O > %uz)",
+                          r->headers_in.content_length_n, plcf->max_body_size);
+            return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+        }
+
         rc = ngx_http_read_client_request_body(r, ngx_http_pgp_auth_submit);
         if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
             return rc;
@@ -997,6 +1054,9 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
+    conf->revoc_fail_open = NGX_CONF_UNSET;
+    conf->gpg_timeout = NGX_CONF_UNSET_MSEC;
+    conf->max_body_size = NGX_CONF_UNSET_SIZE;
 
     return conf;
 }
@@ -1077,6 +1137,10 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               NGX_HTTP_PGP_NONCE_MEMORY);
     ngx_conf_merge_str_value(conf->nonce_addr, prev->nonce_addr, "");
     ngx_conf_merge_str_value(conf->revocation_list, prev->revocation_list, "");
+    /* revocation fails CLOSED by default: an unreadable list denies access */
+    ngx_conf_merge_value(conf->revoc_fail_open, prev->revoc_fail_open, 0);
+    ngx_conf_merge_msec_value(conf->gpg_timeout, prev->gpg_timeout, 2000);
+    ngx_conf_merge_size_value(conf->max_body_size, prev->max_body_size, 16384);
     ngx_conf_merge_str_value(conf->secret_file, prev->secret_file, "");
 
     if (!conf->enable) {

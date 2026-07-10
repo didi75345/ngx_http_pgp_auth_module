@@ -103,6 +103,13 @@ http {
             pgp_revocation_list $WORK/revoked.txt;
             root $WORK/html;
         }
+        location /failclosed/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/does-not-exist.txt;
+            root $WORK/html;
+        }
     }
 }
 EOF
@@ -216,6 +223,28 @@ curl -s -X POST "$base/revoc/?__pgp_auth=1" --data-urlencode "signed@$WORK/vs.as
      -D "$WORK/hv" -o /dev/null >/dev/null
 grep -qi '^set-cookie:' "$WORK/hv" && bad "revoked key rejected" \
     || ok "revoked key rejected"
+
+# Fail-closed revocation: an unreadable list must deny, not silently allow.
+curl -s "$base/failclosed/" -o "$WORK/fc" >/dev/null
+FCH="$(challenge "$WORK/fc")"
+printf '%s' "$FCH" | gpg --clearsign --batch > "$WORK/fs.asc" 2>/dev/null
+curl -s -X POST "$base/failclosed/?__pgp_auth=1" --data-urlencode "signed@$WORK/fs.asc" \
+     -D "$WORK/hfc" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hfc" && bad "unreadable revocation list fails closed" \
+    || ok "unreadable revocation list fails closed"
+
+# Oversized auth body is rejected (413) before gpg is forked.
+head -c 40000 /dev/urandom | base64 > "$WORK/big"
+BC=$(curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" \
+         --data-urlencode "signed@$WORK/big" -w '%{http_code}')
+[ "$BC" = 413 ] && ok "oversized auth body rejected (413)" \
+    || bad "oversized body rejected (got $BC)"
+
+# A non-PGP body is rejected without spawning gpg.
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode 'signed=plain junk, no armor' \
+     -D "$WORK/hj" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hj" && bad "non-PGP body rejected pre-fork" \
+    || ok "non-PGP body rejected pre-fork"
 
 curl -s "$base/short/" -o "$WORK/sp" >/dev/null
 CHS="$(challenge "$WORK/sp")"
