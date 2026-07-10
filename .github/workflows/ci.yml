@@ -38,3 +38,17 @@ jobs:
             gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev gnupg curl
       - name: Build with sanitizers and exercise all paths
         run: sh test/sanitize.sh
+
+  # Static analysis with GCC's built-in analyzer (null-deref, use-after-free,
+  # double-free, leaks, uninitialized values).
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev curl
+      - name: Static analysis (gcc -fanalyzer)
+        run: sh test/analyze.sh

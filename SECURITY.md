@@ -83,6 +83,23 @@ use-after-free, and bad memory access. The module reports **no faults** on any
 input. (Run `sh test/sanitize.sh`; it builds, exercises, and checks the
 sanitizer output, exiting non-zero on any fault in the module.)
 
+**Static analysis** (`test/analyze.sh`): the sources are run through GCC's
+`-fanalyzer` — **no findings**. Both this and the sanitizers run in CI.
+
+### Memory-safety coverage
+
+| Class | Verified by |
+|-------|-------------|
+| Buffer overflow, out-of-bounds read/write | ASan + `-fanalyzer` |
+| Use-after-free | ASan + `-Wanalyzer-use-after-free` |
+| Double free | ASan + `-Wanalyzer-double-free` |
+| Null-pointer dereference | ASan/UBSan + `-Wanalyzer-null-dereference` |
+| Integer overflow | UBSan |
+| Stack overflow (stack-buffer-overflow) | ASan |
+| Memory leak | ASan leak check + `-Wanalyzer-malloc-leak` |
+| Uninitialized memory | `-fanalyzer` |
+| Format-string | `-Wformat` under `-Werror` |
+
 ## Reporting
 
 Please report security issues privately to the maintainer rather than via a
