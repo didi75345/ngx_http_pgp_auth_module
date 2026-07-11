@@ -1,10 +1,5 @@
 # Security notes
 
-The full white-box security audit — all review rounds, every finding with its
-remediation, and the tool results — is in
-[SECURITY_AUDIT_REPORT.md](SECURITY_AUDIT_REPORT.md).
-
-
 This module is written in C and runs inside every nginx worker, so memory
 safety and input handling are the primary concerns. This document records the
 threat model, the defensive choices, and how they are verified.
@@ -44,8 +39,9 @@ Everything else (the keyring, the secret) is operator-controlled.
   under a hard timeout that SIGKILLs a stuck gpg so a worker can never hang.
 - **SIGCHLD-safe.** The gpg child is reaped by the module without racing
   nginx's own SIGCHLD handling.
-- **Secure cookies over TLS.** The session cookie is set with `HttpOnly` and
-  `SameSite=Lax` always, and `Secure` whenever the login arrived over TLS.
+- **Secure cookies over TLS.** The session cookie is set with `HttpOnly`,
+  `SameSite` (`Lax` by default, `Strict`/`None` via `pgp_session_cookie_samesite`),
+  and `Secure` when `pgp_session_cookie_secure` is on.
 - **Rate-limitable logins.** Each login attempt forks a gpg verification, so
   submissions should be capped with nginx's own `limit_req` keyed on the
   `__pgp_auth` argument — see `examples/nginx.conf` for the exact pattern.
@@ -66,11 +62,12 @@ Everything else (the keyring, the secret) is operator-controlled.
 - **Client binding** (`pgp_auth_bind_client_ip`, `pgp_auth_bind_user_agent`,
   both on): the client IP and User-Agent are folded into the token, so a stolen
   challenge or session cookie will not validate from another client.
-- **Secure cookie** (`pgp_session_cookie_secure`, on) with an independent
-  `__Host-` name prefix option (`pgp_session_cookie_host_prefix`, on). For a
-  plain-HTTP deployment, turn `pgp_session_cookie_secure` off (and the prefix,
-  since `__Host-` requires Secure — nginx warns if it's left on). Shorter default
-  challenge/session lifetimes shrink the replay window and blast radius.
+- **Secure cookie** (`pgp_session_cookie_secure`, on) with a `__Host-` name
+  prefix option (`pgp_session_cookie_host_prefix`, on) and a configurable
+  `SameSite` (`pgp_session_cookie_samesite`, default `Lax`). For a plain-HTTP
+  deployment, turn `pgp_session_cookie_secure` off; the `__Host-` prefix is
+  then dropped automatically (it requires Secure), so the cookie stays usable.
+  Shorter default challenge/session lifetimes shrink the replay window.
 - **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
   and all of its live sessions without rotating the secret or reloading nginx.
   An unreadable list **fails closed** (denies) by default
