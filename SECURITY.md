@@ -82,7 +82,13 @@ Everything else (the keyring, the secret) is operator-controlled.
   size-capped once read; a submission that is not a clear-signed block is
   rejected *before* gpg is forked; and each gpg verification is bounded by
   `pgp_gpg_timeout` (2s). Deployments should also put `limit_req` in front of the
-  login submission (see `examples/nginx.conf`).
+  login submission (see `examples/nginx.conf`). The module runs in the
+  PRECONTENT phase, i.e. *after* `limit_req` (PREACCESS) and `auth_basic` /
+  `auth_request` (ACCESS), so those can rate-limit or reject a request before
+  any gpg work happens, and PGP auth layers on top of them.
+- **Relative redirect.** The post-login redirect uses a relative `Location` so
+  it resolves against the URL the browser actually used -- correct behind a
+  reverse proxy or TLS terminator, where nginx's own scheme/host/port differ.
 - **No trust in truncated gpg output**: if gpg's status or output overflows the
   read buffer it is treated as a failure, so a later `BADSIG`/`REVKEYSIG` marker
   cannot be lost past a `VALIDSIG`.
