@@ -49,6 +49,7 @@ typedef struct {
     time_t       session_timeout;     /* seconds; 0 == unlimited            */
     ngx_flag_t   cookie_secure;       /* add "; Secure" to the cookie       */
     ngx_flag_t   cookie_host_prefix;  /* use the __Host- cookie name prefix */
+    ngx_uint_t   cookie_samesite;     /* SameSite: 0=Lax 1=Strict 2=None    */
     ngx_flag_t   bind_ip;             /* mix client IP into the HMAC        */
     ngx_flag_t   bind_ua;             /* mix User-Agent into the HMAC       */
     ngx_uint_t   nonce_storage;       /* none | memory | redis              */
@@ -71,6 +72,20 @@ static ngx_conf_enum_t  ngx_http_pgp_nonce_storage_enum[] = {
     { ngx_string("redis"),  NGX_HTTP_PGP_NONCE_REDIS },
     { ngx_null_string, 0 }
 };
+
+/* SameSite attribute for the session cookie; index into ngx_http_pgp_samesite */
+#define NGX_HTTP_PGP_SAMESITE_LAX     0
+#define NGX_HTTP_PGP_SAMESITE_STRICT  1
+#define NGX_HTTP_PGP_SAMESITE_NONE    2
+
+static ngx_conf_enum_t  ngx_http_pgp_samesite_enum[] = {
+    { ngx_string("Lax"),    NGX_HTTP_PGP_SAMESITE_LAX },
+    { ngx_string("Strict"), NGX_HTTP_PGP_SAMESITE_STRICT },
+    { ngx_string("None"),   NGX_HTTP_PGP_SAMESITE_NONE },
+    { ngx_null_string, 0 }
+};
+
+static const char *ngx_http_pgp_samesite[] = { "Lax", "Strict", "None" };
 
 
 static ngx_int_t ngx_http_pgp_auth_handler(ngx_http_request_t *r);
@@ -146,6 +161,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, cookie_host_prefix),
       NULL },
+
+    { ngx_string("pgp_session_cookie_samesite"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, cookie_samesite),
+      &ngx_http_pgp_samesite_enum },
 
     { ngx_string("pgp_auth_bind_client_ip"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
@@ -414,15 +436,16 @@ ngx_http_pgp_ct_eq(ngx_str_t *a, ngx_str_t *b)
 
 
 /*
- * Session cookie name: __Host-prefixed iff pgp_session_cookie_host_prefix is on.
- * This is an independent option; it is not coupled to anything else. Note the
- * cookie spec requires a __Host- cookie to also be Secure (with Path=/ and no
- * Domain) -- the merge step warns if it is enabled without Secure.
+ * Session cookie name: __Host-prefixed when pgp_session_cookie_host_prefix is on
+ * AND the cookie is Secure. The __Host- prefix *requires* Secure (browsers drop
+ * a __Host- cookie sent without it), so with pgp_session_cookie_secure off the
+ * prefix is not applied -- otherwise the cookie would be rejected and login
+ * would loop. The merge step warns when this happens.
  */
 static void
 ngx_http_pgp_cookie_name(ngx_http_pgp_auth_loc_conf_t *plcf, ngx_str_t *name)
 {
-    if (plcf->cookie_host_prefix) {
+    if (plcf->cookie_host_prefix && plcf->cookie_secure) {
         ngx_str_set(name, NGX_HTTP_PGP_COOKIE_HOST);
     } else {
         ngx_str_set(name, NGX_HTTP_PGP_COOKIE);
@@ -698,13 +721,14 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
      */
     set_cookie->value.data = ngx_pnalloc(r->pool,
         name.len + 1 + plen + 1 + mac.len
-        + sizeof("; Path=/; HttpOnly; SameSite=Lax; Secure") - 1);
+        + sizeof("; Path=/; HttpOnly; SameSite=Strict; Secure") - 1);
     if (set_cookie->value.data == NULL) {
         return NGX_ERROR;
     }
     set_cookie->value.len = ngx_sprintf(set_cookie->value.data,
-        "%V=%*s|%V; Path=/; HttpOnly; SameSite=Lax%s",
+        "%V=%*s|%V; Path=/; HttpOnly; SameSite=%s%s",
         &name, plen, payload, &mac,
+        ngx_http_pgp_samesite[plcf->cookie_samesite],
         plcf->cookie_secure ? "; Secure" : "")
         - set_cookie->value.data;
 
@@ -1079,6 +1103,7 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->session_timeout = NGX_CONF_UNSET;
     conf->cookie_secure = NGX_CONF_UNSET;
     conf->cookie_host_prefix = NGX_CONF_UNSET;
+    conf->cookie_samesite = NGX_CONF_UNSET_UINT;
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
@@ -1174,6 +1199,8 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                              3600);
     ngx_conf_merge_value(conf->cookie_secure, prev->cookie_secure, 1);
     ngx_conf_merge_value(conf->cookie_host_prefix, prev->cookie_host_prefix, 1);
+    ngx_conf_merge_uint_value(conf->cookie_samesite, prev->cookie_samesite,
+                              NGX_HTTP_PGP_SAMESITE_LAX);
     ngx_conf_merge_value(conf->bind_ip, prev->bind_ip, 1);
     ngx_conf_merge_value(conf->bind_ua, prev->bind_ua, 1);
     ngx_conf_merge_uint_value(conf->nonce_storage, prev->nonce_storage,
@@ -1191,14 +1218,25 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     /*
-     * The two cookie options are independent. But the cookie spec requires a
-     * __Host- cookie to be Secure, so warn (don't override) if the prefix is on
-     * without Secure -- browsers would drop such a cookie.
+     * The cookie spec requires a __Host- cookie to be Secure; a browser drops a
+     * __Host- cookie sent without it, which would break login entirely. So when
+     * Secure is off the prefix is not applied (see ngx_http_pgp_cookie_name) --
+     * warn that it was dropped rather than emit an unusable cookie.
      */
     if (conf->cookie_host_prefix && !conf->cookie_secure) {
         ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-            "pgp_auth: pgp_session_cookie_host_prefix is on but "
-            "pgp_session_cookie_secure is off; browsers reject a __Host- "
+            "pgp_auth: pgp_session_cookie_host_prefix is ignored because "
+            "pgp_session_cookie_secure is off (the __Host- prefix requires "
+            "Secure); using the unprefixed cookie name");
+    }
+
+    /* SameSite=None also requires Secure, or browsers drop the cookie. */
+    if (conf->cookie_samesite == NGX_HTTP_PGP_SAMESITE_NONE
+        && !conf->cookie_secure)
+    {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "pgp_auth: pgp_session_cookie_samesite None requires "
+            "pgp_session_cookie_secure on; browsers reject a SameSite=None "
             "cookie without Secure");
     }
 

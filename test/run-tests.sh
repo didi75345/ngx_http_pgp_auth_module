@@ -113,6 +113,14 @@ http {
             pgp_revocation_list $WORK/does-not-exist.txt;
             root $WORK/html;
         }
+        location /strict/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_session_cookie_samesite Strict;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
         location /basicauth/ {
             auth_basic "restricted";
             auth_basic_user_file $WORK/htpasswd;
@@ -338,6 +346,17 @@ EOF
 else
     echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
+
+# SameSite: the /strict/ location sets pgp_session_cookie_samesite Strict, so a
+# successful login there must emit a cookie with SameSite=Strict.
+curl -s "$base/strict/" -o "$WORK/sp" >/dev/null
+SCH="$(challenge "$WORK/sp")"
+printf '%s' "$SCH" | gpg --clearsign --batch > "$WORK/ss.asc" 2>/dev/null
+curl -s -X POST "$base/strict/?__pgp_auth=1" --data-urlencode "signed@$WORK/ss.asc" \
+     -D "$WORK/hss" -o /dev/null >/dev/null
+grep -i '^set-cookie:' "$WORK/hss" | grep -q 'SameSite=Strict' \
+    && ok "SameSite=Strict honoured on the cookie" \
+    || bad "SameSite=Strict option"
 
 # auth_basic ordering: when combined with the module, basic auth must gate
 # FIRST -- an unauthenticated request is rejected (401) before the module runs,
