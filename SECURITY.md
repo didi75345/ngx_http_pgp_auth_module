@@ -61,10 +61,11 @@ Everything else (the keyring, the secret) is operator-controlled.
 - **Client binding** (`pgp_auth_bind_client_ip`, `pgp_auth_bind_user_agent`,
   both on): the client IP and User-Agent are folded into the token, so a stolen
   challenge or session cookie will not validate from another client.
-- **Secure cookie** (`pgp_session_cookie_secure`, on) with an optional `__Host-`
-  name prefix (`pgp_session_cookie_host_prefix`, on; auto-dropped without
-  Secure, e.g. a Tor hidden service on plain HTTP), and shorter default
-  challenge/session lifetimes to shrink the replay window and blast radius.
+- **Secure cookie** (`pgp_session_cookie_secure`, on) with an independent
+  `__Host-` name prefix option (`pgp_session_cookie_host_prefix`, on). For a
+  plain-HTTP deployment, turn `pgp_session_cookie_secure` off (and the prefix,
+  since `__Host-` requires Secure — nginx warns if it's left on). Shorter default
+  challenge/session lifetimes shrink the replay window and blast radius.
 - **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
   and all of its live sessions without rotating the secret or reloading nginx.
   An unreadable list **fails closed** (denies) by default
