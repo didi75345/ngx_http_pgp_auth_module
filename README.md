@@ -32,8 +32,8 @@ they only need to share one secret (`pgp_session_secret`).
 | `pgp_session_secret` | *(random)* | File with the HMAC secret. **Set this** for multi-node / restart-stable sessions. |
 | `pgp_challenge_timeout` | `120s` | How long an issued challenge stays valid. |
 | `pgp_session_timeout` | `1h` | Re-challenge interval. `0` = unlimited. |
-| `pgp_session_cookie_secure` | `on` | Add `; Secure` to the session cookie (set `off` for plain-HTTP, e.g. a Tor hidden service where the transport is already encrypted). |
-| `pgp_session_cookie_host_prefix` | `on` | Use the `__Host-` cookie name prefix (auto-dropped when the cookie is not Secure). |
+| `pgp_session_cookie_secure` | `on` | Add `; Secure` to the session cookie. Set `off` for a plain-HTTP deployment (e.g. one already behind an encrypted transport). |
+| `pgp_session_cookie_host_prefix` | `on` | Use the `__Host-` cookie name prefix. Independent option; the spec requires it to be Secure, so nginx warns if it's on without `pgp_session_cookie_secure`. |
 | `pgp_auth_bind_client_ip` | `on` | Fold the client IP into the token, blocking cross-IP replay. Behind a proxy, configure `ngx_http_realip_module`. |
 | `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
 | `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |

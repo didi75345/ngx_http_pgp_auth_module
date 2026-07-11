@@ -414,16 +414,15 @@ ngx_http_pgp_ct_eq(ngx_str_t *a, ngx_str_t *b)
 
 
 /*
- * Session cookie name. The __Host- prefix is used only when it is enabled AND
- * the cookie is Secure, because the prefix mandates Secure + Path=/ + no Domain
- * -- browsers reject a __Host- cookie without them. So a Tor-hidden-service
- * setup that runs plain HTTP (pgp_session_cookie_secure off) automatically
- * falls back to the plain name instead of emitting a cookie that gets dropped.
+ * Session cookie name: __Host-prefixed iff pgp_session_cookie_host_prefix is on.
+ * This is an independent option; it is not coupled to anything else. Note the
+ * cookie spec requires a __Host- cookie to also be Secure (with Path=/ and no
+ * Domain) -- the merge step warns if it is enabled without Secure.
  */
 static void
 ngx_http_pgp_cookie_name(ngx_http_pgp_auth_loc_conf_t *plcf, ngx_str_t *name)
 {
-    if (plcf->cookie_host_prefix && plcf->cookie_secure) {
+    if (plcf->cookie_host_prefix) {
         ngx_str_set(name, NGX_HTTP_PGP_COOKIE_HOST);
     } else {
         ngx_str_set(name, NGX_HTTP_PGP_COOKIE);
@@ -1174,6 +1173,18 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (!conf->enable) {
         return NGX_CONF_OK;
+    }
+
+    /*
+     * The two cookie options are independent. But the cookie spec requires a
+     * __Host- cookie to be Secure, so warn (don't override) if the prefix is on
+     * without Secure -- browsers would drop such a cookie.
+     */
+    if (conf->cookie_host_prefix && !conf->cookie_secure) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "pgp_auth: pgp_session_cookie_host_prefix is on but "
+            "pgp_session_cookie_secure is off; browsers reject a __Host- "
+            "cookie without Secure");
     }
 
     /* an absolute keyring path is required for gpg */
