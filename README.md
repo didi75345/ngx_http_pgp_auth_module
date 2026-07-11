@@ -9,19 +9,36 @@ own key (e.g. **Kleopatra → Notepad → Sign**), pastes the signed block back,
 the module verifies it against a public keyring before granting a session. No
 passwords, and the user's private key never leaves their machine.
 
-## Why it's stateless
+## State model
 
-Both the challenge and the session are **HMAC-signed tokens**, not server-side
-records:
+The **authentication tokens themselves are stateless**. Both the challenge and
+the session are HMAC-signed, not server-side records:
 
 ```
 challenge = v1|<exp>|<nonce>|<mac>     mac = HMAC(secret, "v1|<exp>|<nonce>")
 session   = <exp>|<fpr>|<mac>          mac = HMAC(secret, "<exp>|<fpr>")
 ```
 
-The server recognises its own tokens by re-deriving the MAC, so there is nothing
-to store and nothing to replicate. Run as many nginx containers as you like —
-they only need to share one secret (`pgp_session_secret`).
+The server recognises its own tokens by re-deriving the MAC with
+`pgp_session_secret`, so a session or challenge needs nothing stored or
+replicated — every node that shares the secret accepts the same tokens.
+
+The one optional piece of state is **single-use challenge enforcement**
+(`pgp_auth_nonce_storage`), which remembers spent challenges so a captured,
+already-signed challenge can't be replayed inside its validity window:
+
+- `memory` (default) — a per-node shared-memory zone. Cheap and dependency-free,
+  but the seen-nonce set is local to each nginx instance and is cleared on
+  restart, so it does not span multiple nodes.
+- `redis` — a shared store, so single-use holds across every node pointed at the
+  same Redis. Use this for a multi-node deployment that needs strict replay
+  protection.
+- `none` — no nonce state at all; fully stateless. A signed challenge may then be
+  replayed until it expires, so keep `pgp_challenge_timeout` short and serve over
+  HTTPS.
+
+So out of the box it is stateless apart from a local single-use cache; pick
+`redis` for shared single-use across nodes, or `none` for no server state at all.
 
 ## Directives
 
@@ -116,11 +133,12 @@ a bad signature.
   authenticate with a challenge we never issued.
 - Sessions are stateless. To revoke everyone, rotate `pgp_session_secret`. A key
   removed from the keyring is rejected at the next re-challenge.
-- **Trade-off:** without shared state, single-use cannot be strictly enforced
-  across nodes — within `pgp_challenge_timeout` a captured, already-signed
-  challenge could be replayed. Keep the timeout short and serve over HTTPS.
-  Strict single-use would require a shared store (e.g. Redis); deliberately left
-  out to avoid the dependency.
+- **Single-use across nodes:** with `pgp_auth_nonce_storage none` — or `memory`,
+  whose seen-nonce cache is per-node — a captured, already-signed challenge can
+  be replayed within `pgp_challenge_timeout`, so keep it short and serve over
+  HTTPS. For strict single-use across every node, use `pgp_auth_nonce_storage
+  redis` (a shared store); the default `memory` gives per-node enforcement with
+  no extra dependency.
 
 For the threat model, defensive design, and how memory safety is verified
 (ASan/UBSan + the attack suite), see [SECURITY.md](SECURITY.md).
