@@ -1,5 +1,10 @@
 # Security notes
 
+The full white-box security audit — all review rounds, every finding with its
+remediation, and the tool results — is in
+[SECURITY_AUDIT_REPORT.md](SECURITY_AUDIT_REPORT.md).
+
+
 This module is written in C and runs inside every nginx worker, so memory
 safety and input handling are the primary concerns. This document records the
 threat model, the defensive choices, and how they are verified.
