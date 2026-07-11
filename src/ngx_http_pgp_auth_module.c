@@ -667,7 +667,7 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     u_char           *payload;
     size_t            plen;
     ngx_str_t         mac, name;
-    ngx_table_elt_t  *set_cookie;
+    ngx_table_elt_t  *set_cookie, *location;
 
     exp = (plcf->session_timeout == 0) ? 0 : ngx_time() + plcf->session_timeout;
 
@@ -708,18 +708,29 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
         plcf->cookie_secure ? "; Secure" : "")
         - set_cookie->value.data;
 
-    /* redirect to the same URI without the auth query argument */
-    ngx_http_clear_location(r);
-    r->headers_out.location = ngx_list_push(&r->headers_out.headers);
-    if (r->headers_out.location == NULL) {
+    /*
+     * Redirect to the same path without the auth query argument.
+     *
+     * Emit a RELATIVE Location (just the path) as a plain header rather than via
+     * r->headers_out.location -- the latter is rewritten to an absolute URL
+     * using nginx's own scheme/host/listen-port, which is wrong behind a proxy
+     * or TLS terminator (the browser would be sent to nginx's internal port).
+     * A relative Location is resolved by the browser against the URL it actually
+     * connected to, so it works behind any front end.
+     */
+    location = ngx_list_push(&r->headers_out.headers);
+    if (location == NULL) {
         return NGX_ERROR;
     }
-    r->headers_out.location->hash = 1;
-    ngx_str_set(&r->headers_out.location->key, "Location");
-    r->headers_out.location->value = r->uri;
+    location->hash = 1;
+    ngx_str_set(&location->key, "Location");
+    location->value = r->uri;
 
     /* 303 See Other: the correct Post/Redirect/Get response -- the client
-     * re-fetches the target with GET, not by repeating the POST. */
+     * re-fetches the target with GET, not by repeating the POST. We send the
+     * (bodyless) response ourselves so nginx does not absolutize the Location. */
+    r->headers_out.status = NGX_HTTP_SEE_OTHER;
+    r->headers_out.content_length_n = 0;
     return NGX_HTTP_SEE_OTHER;
 }
 
@@ -971,12 +982,16 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
 
     if (rc == NGX_HTTP_SEE_OTHER) {
         /*
-         * Cookie + Location are already set on headers_out; let nginx's
-         * special-response machinery build the redirect (it preserves our
-         * Set-Cookie header). Finalizing with the 3xx code is what triggers
-         * that, so we must NOT have sent a header ourselves first.
+         * Send the 303 ourselves (status + Set-Cookie + relative Location, no
+         * body). Going through nginx's special-response path instead would
+         * rewrite the Location to an absolute URL with nginx's own port.
          */
-        ngx_http_finalize_request(r, NGX_HTTP_SEE_OTHER);
+        rc = ngx_http_send_header(r);
+        if (rc == NGX_ERROR || rc > NGX_OK) {
+            ngx_http_finalize_request(r, rc);
+            return;
+        }
+        ngx_http_finalize_request(r, ngx_http_send_special(r, NGX_HTTP_LAST));
         return;
     }
 
@@ -1266,11 +1281,16 @@ ngx_http_pgp_auth_init(ngx_conf_t *cf)
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
     /*
-     * ACCESS phase (like auth_basic), not PREACCESS: this keeps the module
-     * *after* limit_req, so operators can rate-limit login attempts before a
-     * gpg verification is ever forked.
+     * PRECONTENT phase -- deliberately after the ACCESS phase. nginx copies a
+     * phase's handlers into the engine in reverse registration order, so a
+     * dynamically-loaded module in the ACCESS phase would run *before* the core
+     * access modules. Running in PRECONTENT (which is after PREACCESS, ACCESS
+     * and POST_ACCESS) puts this module after both limit_req (PREACCESS) and
+     * auth_basic / auth_request (ACCESS): a request can be rate-limited or
+     * rejected by basic auth before any gpg verification is forked, and PGP auth
+     * layers on top of them.
      */
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }

@@ -64,6 +64,9 @@ echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 gpg --list-keys --with-colons test@example.com \
     | awk -F: '/^fpr:/{print $10; exit}' > "$WORK/revoked.txt"
 
+# htpasswd for the auth_basic ordering test (user pgptest / pass pw)
+printf '%s\n' 'pgptest:$apr1$abcd1234$UEURWw71lGBk.LwDG1Xr4/' > "$WORK/htpasswd"
+
 # --- nginx config ------------------------------------------------------------
 {
     [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
@@ -110,6 +113,15 @@ http {
             pgp_revocation_list $WORK/does-not-exist.txt;
             root $WORK/html;
         }
+        location /basicauth/ {
+            auth_basic "restricted";
+            auth_basic_user_file $WORK/htpasswd;
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
     }
 }
 EOF
@@ -135,6 +147,22 @@ curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/s.asc" \
      -D "$WORK/h1" -o /dev/null -w '%{http_code}' > "$WORK/c2"
 [ "$(cat "$WORK/c2")" = 303 ] && grep -qi 'set-cookie:.*pgp_session=' "$WORK/h1" \
     && ok "valid signature returns 303 + session cookie" || bad "valid sign-in"
+
+# The redirect Location must be RELATIVE (no scheme/host/port) so it works
+# behind a proxy or TLS terminator -- nginx must not absolutize it to its own
+# listen port. Sent with a proxy-style Host that carries no port. (Fresh
+# challenge, since the previous one is now spent by the single-use store.)
+curl -s "$base/" -o "$WORK/lop" >/dev/null
+LOCH="$(challenge "$WORK/lop")"
+printf '%s' "$LOCH" | gpg --clearsign --batch > "$WORK/los.asc" 2>/dev/null
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/los.asc" \
+     -H 'Host: example.com' -D "$WORK/hloc" -o /dev/null >/dev/null
+LOCVAL="$(grep -i '^location:' "$WORK/hloc" | sed 's/[^:]*: //' | tr -d '\r')"
+case "$LOCVAL" in
+    /*) case "$LOCVAL" in *"://"*) bad "redirect Location is relative ($LOCVAL)";;
+                          *) ok "redirect Location is relative ($LOCVAL)";; esac;;
+    *)  bad "redirect Location is relative ($LOCVAL)";;
+esac
 
 CK="$(grep -i '^set-cookie:' "$WORK/h1" | sed 's/[Ss]et-[Cc]ookie: //;s/;.*//' | tr -d '\r')"
 curl -s -b "$CK" "$base/" -o "$WORK/p2" -w '%{http_code}' > "$WORK/c3"
@@ -310,6 +338,18 @@ EOF
 else
     echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
+
+# auth_basic ordering: when combined with the module, basic auth must gate
+# FIRST -- an unauthenticated request is rejected (401) before the module runs,
+# so no gpg is forked. With valid basic creds, the PGP challenge is served.
+BAC=$(curl -s -o /dev/null -X POST "$base/basicauth/?__pgp_auth=1" \
+          --data-urlencode 'signed=x' -w '%{http_code}')
+[ "$BAC" = 401 ] && ok "auth_basic gates before the module (no creds -> 401)" \
+    || bad "auth_basic ordering (got $BAC)"
+curl -s -u pgptest:pw "$base/basicauth/" -o "$WORK/bap" >/dev/null
+grep -q 'v1|' "$WORK/bap" \
+    && ok "with basic creds, PGP challenge is served" \
+    || bad "basic+pgp layered challenge"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
