@@ -1,2 +1,1 @@
-# ngx_http_pgp_auth_module
-Passwordless authentication for Nginx using OpenPGP signatures.
+CCS-REVIEW-7F3A9
