@@ -301,18 +301,70 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         p = line + 9;
 
         if (ngx_strncmp(p, "VALIDSIG ", 9) == 0) {
+            char    *q, *tok;
+            size_t   i;
+
             p += 9;
+
+            /*
+             * VALIDSIG args:
+             *   <signing-key-fpr> <date> <ts> <exp> <ver> <rsv> <algo>
+             *   <hash> <sig-class> <primary-key-fpr>
+             * Identify the signer by the PRIMARY key fingerprint (the last
+             * field), not the first. When a signature is made by a signing
+             * SUBKEY, field 1 is the subkey fpr; keying identity/revocation
+             * off it would let a key revoked by its (primary) fingerprint
+             * still authenticate, and would change a user's identity whenever
+             * they rotate a subkey. The last field equals field 1 when the
+             * primary signs directly, so using it is always correct.
+             */
+            tok = p;
+            for (q = p; ; ) {
+                while (*q == ' ') { q++; }
+                if (*q == '\0') { break; }
+                tok = q;                         /* start of a token       */
+                while (*q != '\0' && *q != ' ') { q++; }
+            }
+
             n = 0;
-            while (p[n] != '\0' && p[n] != ' '
+            while (tok[n] != '\0' && tok[n] != ' '
                    && (size_t) n < sizeof(res->fpr) - 1)
             {
-                res->fpr[n] = (u_char) p[n];
+                res->fpr[n] = (u_char) tok[n];
                 n++;
             }
             res->fpr[n] = '\0';
-            res->fpr_len = (size_t) n;
-            if (n >= 32) {                      /* reject empty/short fpr */
+
+            /* the last field must look like a fingerprint (hex, >= 32) */
+            for (i = 0; i < (size_t) n; i++) {
+                u_char c = res->fpr[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+                      || (c >= 'A' && c <= 'F')))
+                {
+                    break;
+                }
+            }
+
+            if (n >= 32 && i == (size_t) n) {
+                res->fpr_len = (size_t) n;      /* primary key fingerprint */
                 good = 1;
+            } else {
+                /*
+                 * No usable primary-key-fpr (e.g. a very old gpg whose
+                 * VALIDSIG omits it) -- fall back to field 1 (signing key).
+                 */
+                n = 0;
+                while (p[n] != '\0' && p[n] != ' '
+                       && (size_t) n < sizeof(res->fpr) - 1)
+                {
+                    res->fpr[n] = (u_char) p[n];
+                    n++;
+                }
+                res->fpr[n] = '\0';
+                res->fpr_len = (size_t) n;
+                if (n >= 32) {
+                    good = 1;
+                }
             }
 
         } else if (ngx_strncmp(p, "REVKEYSIG", 9) == 0     /* revoked key   */

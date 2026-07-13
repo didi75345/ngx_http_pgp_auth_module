@@ -64,6 +64,21 @@ echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 gpg --list-keys --with-colons test@example.com \
     | awk -F: '/^fpr:/{print $10; exit}' > "$WORK/revoked.txt"
 
+# a third key that SIGNS WITH A DEDICATED SUBKEY (cert-only primary + signing
+# subkey), kept in its own home so it does not change the default signing key
+# for the other tests. Only its PUBLIC key joins the keyring. Used to prove that
+# revoking the PRIMARY fingerprint catches a signature made by the subkey.
+export GNUPGHOME="$WORK/gpg3"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-generate-key "SubSigner <subsigner@example.com>" ed25519 cert never >/dev/null 2>&1
+SUBPRIMARY="$(gpg --list-keys --with-colons subsigner@example.com \
+              | awk -F: '/^fpr:/{print $10; exit}')"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-add-key "$SUBPRIMARY" ed25519 sign never >/dev/null 2>&1
+gpg --export subsigner@example.com >> "$WORK/pubkeys.gpg"   # append to keyring
+export GNUPGHOME="$WORK/gpg"
+echo "$SUBPRIMARY" > "$WORK/revoked-primary.txt"            # revoke by PRIMARY fpr
+
 # htpasswd for the auth_basic ordering test (user pgptest / pass pw)
 printf '%s\n' 'pgptest:$apr1$abcd1234$UEURWw71lGBk.LwDG1Xr4/' > "$WORK/htpasswd"
 
@@ -118,6 +133,14 @@ http {
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_session_cookie_samesite Strict;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+        location /revoc-subkey/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-primary.txt;
             pgp_auth_nonce_storage none;
             root $WORK/html;
         }
@@ -346,6 +369,34 @@ EOF
 else
     echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
+
+# Subkey identity + revocation: a login signed by a SIGNING SUBKEY must be
+# identified by (and revocable through) the PRIMARY key fingerprint. Signing
+# happens in the subsigner's own gpg home.
+SUBHOME="$WORK/gpg3"
+curl -s "$base/" -o "$WORK/skp" >/dev/null
+SKCH="$(challenge "$WORK/skp")"
+printf '%s' "$SKCH" | GNUPGHOME="$SUBHOME" gpg --clearsign --batch \
+    --pinentry-mode loopback --passphrase '' > "$WORK/sks.asc" 2>/dev/null
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/sks.asc" \
+     -D "$WORK/hsk" -o /dev/null >/dev/null
+# the granted cookie must carry the PRIMARY fpr, never the subkey fpr
+if grep -i '^set-cookie:' "$WORK/hsk" | grep -q "$SUBPRIMARY"; then
+    ok "subkey signature is identified by the primary key fingerprint"
+else
+    bad "subkey signer not bound to primary fpr"
+fi
+
+# now revoke by the PRIMARY fpr and confirm the subkey signature is rejected
+curl -s "$base/revoc-subkey/" -o "$WORK/skp2" >/dev/null
+SKCH2="$(challenge "$WORK/skp2")"
+printf '%s' "$SKCH2" | GNUPGHOME="$SUBHOME" gpg --clearsign --batch \
+    --pinentry-mode loopback --passphrase '' > "$WORK/sks2.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-subkey/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/sks2.asc" -D "$WORK/hsk2" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hsk2" \
+    && bad "subkey signature NOT revoked by primary fpr (revocation bypass)" \
+    || ok "revocation by primary fpr rejects a subkey signature"
 
 # SameSite: the /strict/ location sets pgp_session_cookie_samesite Strict, so a
 # successful login there must emit a cookie with SameSite=Strict.
