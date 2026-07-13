@@ -54,13 +54,16 @@ typedef struct {
     ngx_flag_t   bind_ua;             /* mix User-Agent into the HMAC       */
     ngx_uint_t   nonce_storage;       /* none | memory | redis              */
     ngx_shm_zone_t *nonce_zone;       /* shared zone for the memory backend */
+    size_t       nonce_zone_size;     /* size of that shared zone           */
     ngx_str_t    nonce_addr;          /* redis host:port                    */
+    ngx_str_t    nonce_password;      /* redis AUTH password (optional)     */
     ngx_str_t    revocation_list;     /* path: revoked key fingerprints     */
     ngx_flag_t   revoc_fail_open;     /* on error, allow (1) or deny (0)    */
     time_t       revoc_mtime;         /* cached file mtime (per worker)     */
     ngx_str_t    revoc_cache;         /* cached file contents (per worker)  */
     ngx_msec_t   gpg_timeout;         /* max ms for one gpg verify          */
     size_t       max_body_size;       /* cap on the submitted auth body     */
+    ngx_str_t    gpg_path;            /* absolute path to the gpg binary    */
     ngx_str_t    secret_file;
     ngx_str_t    secret;              /* loaded HMAC secret bytes           */
 } ngx_http_pgp_auth_loc_conf_t;
@@ -197,6 +200,20 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_addr),
       NULL },
 
+    { ngx_string("pgp_auth_nonce_zone_size"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_zone_size),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_password"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_password),
+      NULL },
+
     { ngx_string("pgp_revocation_list"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
@@ -223,6 +240,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_size_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, max_body_size),
+      NULL },
+
+    { ngx_string("pgp_gpg_path"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, gpg_path),
       NULL },
 
       ngx_null_command
@@ -601,7 +625,8 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->keyring, msg, len,
+    if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->gpg_path,
+                                &plcf->keyring, msg, len,
                                 plcf->gpg_timeout, &vr) != NGX_OK)
     {
         return NGX_ERROR;
@@ -686,7 +711,8 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
         nonce.len = s3 - (s2 + 1);
 
         rc = ngx_http_pgp_nonce_check_and_set(r, plcf->nonce_storage,
-                 plcf->nonce_zone, &plcf->nonce_addr, &nonce, exp);
+                 plcf->nonce_zone, &plcf->nonce_addr, &plcf->nonce_password,
+                 &nonce, exp);
         if (rc == NGX_DECLINED) {
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                           "pgp_auth: challenge already used (replay)");
@@ -875,6 +901,39 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
     r->headers_out.content_length_n = end - body;
     ngx_str_set(&r->headers_out.content_type, "text/html");
     r->headers_out.content_type_len = r->headers_out.content_type.len;
+
+    /*
+     * The login page is a bare-bones HTML form; without these headers it can
+     * be framed by a third-party page (clickjacking a submit onto a signed
+     * challenge), MIME-sniffed into executing as something other than HTML,
+     * or cached somewhere that shouldn't hold an auth challenge.
+     */
+    {
+        static const struct { const char *k, *v; } sec_headers[] = {
+            { "X-Frame-Options",        "DENY" },
+            { "X-Content-Type-Options", "nosniff" },
+            { "Content-Security-Policy",
+              "default-src 'none'; style-src 'unsafe-inline'; "
+              "frame-ancestors 'none'" },
+            { "Cache-Control", "no-store" },
+            { "Referrer-Policy", "no-referrer" },
+        };
+        ngx_table_elt_t  *h;
+        ngx_uint_t        i;
+
+        for (i = 0; i < sizeof(sec_headers) / sizeof(sec_headers[0]); i++) {
+            h = ngx_list_push(&r->headers_out.headers);
+            if (h == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            h->hash = 1;
+            h->key.data = (u_char *) sec_headers[i].k;
+            h->key.len = ngx_strlen(sec_headers[i].k);
+            /* string literals: safe to point directly at, no pool copy needed */
+            h->value.data = (u_char *) sec_headers[i].v;
+            h->value.len = ngx_strlen(sec_headers[i].v);
+        }
+    }
 
     rc = ngx_http_send_header(r);
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
@@ -1131,6 +1190,7 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
+    conf->nonce_zone_size = NGX_CONF_UNSET_SIZE;
     conf->revoc_fail_open = NGX_CONF_UNSET;
     conf->gpg_timeout = NGX_CONF_UNSET_MSEC;
     conf->max_body_size = NGX_CONF_UNSET_SIZE;
@@ -1229,16 +1289,31 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->bind_ua, prev->bind_ua, 1);
     ngx_conf_merge_uint_value(conf->nonce_storage, prev->nonce_storage,
                               NGX_HTTP_PGP_NONCE_MEMORY);
+    ngx_conf_merge_size_value(conf->nonce_zone_size, prev->nonce_zone_size,
+                              NGX_HTTP_PGP_NONCE_ZONE_SIZE);
     ngx_conf_merge_str_value(conf->nonce_addr, prev->nonce_addr, "");
+    ngx_conf_merge_str_value(conf->nonce_password, prev->nonce_password, "");
     ngx_conf_merge_str_value(conf->revocation_list, prev->revocation_list, "");
     /* revocation fails CLOSED by default: an unreadable list denies access */
     ngx_conf_merge_value(conf->revoc_fail_open, prev->revoc_fail_open, 0);
     ngx_conf_merge_msec_value(conf->gpg_timeout, prev->gpg_timeout, 2000);
     ngx_conf_merge_size_value(conf->max_body_size, prev->max_body_size, 16384);
     ngx_conf_merge_str_value(conf->secret_file, prev->secret_file, "");
+    /*
+     * Absolute path only, never a bare "gpg" -- the verifier execve()s this
+     * directly with no PATH search, so a relative value would simply fail to
+     * exec rather than silently falling back to something PATH-resolved.
+     */
+    ngx_conf_merge_str_value(conf->gpg_path, prev->gpg_path, "/usr/bin/gpg");
 
     if (!conf->enable) {
         return NGX_CONF_OK;
+    }
+
+    if (conf->gpg_path.len == 0 || conf->gpg_path.data[0] != '/') {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "pgp_auth: pgp_gpg_path must be an absolute path");
+        return NGX_CONF_ERROR;
     }
 
     /*
@@ -1274,7 +1349,7 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_MEMORY) {
         conf->nonce_zone = prev->nonce_zone
             ? prev->nonce_zone
-            : ngx_http_pgp_nonce_add_zone(cf, NGX_HTTP_PGP_NONCE_ZONE_SIZE);
+            : ngx_http_pgp_nonce_add_zone(cf, conf->nonce_zone_size);
         if (conf->nonce_zone == NULL) {
             return NGX_CONF_ERROR;
         }

@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,8 +67,8 @@ ngx_http_pgp_gpg_cleanup(const char *home, const char *msgpath)
 
 
 ngx_int_t
-ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
-    u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
+ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
+    ngx_str_t *keyring, u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
     ngx_http_pgp_verify_result_t *res)
 {
     pid_t        pid;
@@ -78,11 +79,17 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     char         msgpath[PATH_MAX];
     char         plainpath[PATH_MAX];
     char         keyringz[PATH_MAX];
+    char         gpgz[PATH_MAX];
     char         out[8192];
     char        *p, *line, *save;
     int64_t      deadline;
     ngx_int_t    good, bad, truncated;
     sigset_t     chld, prev;
+    /* Minimal, fixed environment for the child: never forward whatever the
+     * worker process happens to have (LD_PRELOAD, LD_LIBRARY_PATH, GNUPGHOME,
+     * a hostile PATH, ...) into the subprocess we spawn on every
+     * unauthenticated login attempt. */
+    static char *child_envp[] = { NULL };
 
     truncated = 0;
 
@@ -97,6 +104,21 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
     }
     ngx_memcpy(keyringz, keyring->data, keyring->len);
     keyringz[keyring->len] = '\0';
+
+    /*
+     * gpg_path is validated at config time to be a non-empty absolute path
+     * (see ngx_http_pgp_auth_merge_loc_conf); re-check defensively before
+     * handing it to execve() so a NULL/garbage value can never reach exec.
+     */
+    if (gpg_path->len == 0 || gpg_path->len >= PATH_MAX
+        || gpg_path->data[0] != '/')
+    {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "pgp_auth: invalid gpg binary path");
+        return NGX_ERROR;
+    }
+    ngx_memcpy(gpgz, gpg_path->data, gpg_path->len);
+    gpgz[gpg_path->len] = '\0';
 
     if (mkdtemp(home) == NULL) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
@@ -167,24 +189,55 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         if (devnull != -1) {
             dup2(devnull, STDERR_FILENO);
         }
-        for (fd = 3; fd < 1024; fd++) {
-            close(fd);
+        /*
+         * Close every inherited fd >= 3 before exec, so the gpg child never
+         * holds nginx's listening sockets, client connections, log fds, etc.
+         * A hardcoded "< 1024" bound is not safe: worker_rlimit_nofile is
+         * commonly raised well above 1024 (10000+ is typical), which would
+         * leave higher-numbered fds open and reachable to the child. Prefer
+         * close_range() (one syscall, Linux 5.9+); fall back to sysconf's
+         * actual fd ceiling if the syscall is unavailable or fails.
+         */
+#if defined(__linux__) && defined(SYS_close_range)
+        if (syscall(SYS_close_range, 3, ~0U, 0) != 0)
+#endif
+        {
+            long max_fd = sysconf(_SC_OPEN_MAX);
+            if (max_fd <= 0 || max_fd > 1000000) {
+                max_fd = 1024;    /* sane fallback if sysconf is unusable */
+            }
+            for (fd = 3; fd < max_fd; fd++) {
+                close(fd);
+            }
         }
         sigprocmask(SIG_SETMASK, &prev, NULL);   /* gpg runs with a normal mask */
         /*
          * --decrypt (not --verify) so gpg writes the signed plaintext to
          * --output; --verify alone produces no output to bind the challenge to.
+         *
+         * execve() with an absolute path and an empty envp, NOT execlp():
+         * execlp() searches $PATH for "gpg", so anything earlier in the
+         * worker's PATH (or a hostile PATH set via the environment) could be
+         * run instead of the real gpg binary. Using the operator-configured
+         * absolute path (pgp_gpg_path) and clearing the environment removes
+         * both the PATH-search risk and LD_PRELOAD/LD_LIBRARY_PATH-style
+         * library injection via inherited environment variables.
          */
-        execlp("gpg", "gpg",
-               "--homedir", home,
-               "--no-default-keyring",
-               "--keyring", keyringz,
-               "--status-fd", "1",
-               "--output", plainpath,
-               "--batch", "--no-tty", "--yes",
-               "--no-autostart",       /* signature verify needs no gpg-agent */
-               "--decrypt", msgpath,
-               (char *) NULL);
+        {
+            char *argv[] = {
+                gpgz,
+                "--homedir", home,
+                "--no-default-keyring",
+                "--keyring", keyringz,
+                "--status-fd", "1",
+                "--output", plainpath,
+                "--batch", "--no-tty", "--yes",
+                "--no-autostart",   /* signature verify needs no gpg-agent */
+                "--decrypt", msgpath,
+                NULL
+            };
+            execve(gpgz, argv, child_envp);
+        }
         _exit(127);
     }
 
@@ -397,8 +450,13 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
         int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 
         for (p = out; *p; p++) {
+            /* collapse newlines to spaces and strip anything else that isn't
+             * plain printable ASCII, so gpg's own text can't inject escape
+             * sequences or otherwise confuse whatever reads the log */
             if (*p == '\n' || *p == '\r') {
                 *p = ' ';
+            } else if ((unsigned char) *p < 0x20 || (unsigned char) *p == 0x7f) {
+                *p = '?';
             }
         }
 

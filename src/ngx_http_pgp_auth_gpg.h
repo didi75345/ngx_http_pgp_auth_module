@@ -17,7 +17,7 @@
 
 typedef struct {
     ngx_int_t  valid;            /* 1 if a good signature from a keyring key */
-    u_char     fpr[80];          /* hex fpr of the signer's PRIMARY key       */
+    u_char     fpr[80];          /* hex fingerprint of the signing key       */
     size_t     fpr_len;
 
     /*
@@ -37,8 +37,8 @@ typedef struct {
  * Returns NGX_OK if the verification ran (regardless of result), NGX_ERROR on
  * an internal failure.
  */
-ngx_int_t ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *keyring,
-    u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
+ngx_int_t ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
+    ngx_str_t *keyring, u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
     ngx_http_pgp_verify_result_t *res);
 
 #endif /* NGX_HTTP_PGP_AUTH_GPG_H */
