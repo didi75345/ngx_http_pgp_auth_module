@@ -40,6 +40,6 @@ ngx_shm_zone_t *ngx_http_pgp_nonce_add_zone(ngx_conf_t *cf, size_t size);
  */
 ngx_int_t ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r,
     ngx_uint_t storage, ngx_shm_zone_t *zone, ngx_str_t *addr,
-    ngx_str_t *nonce, time_t exp);
+    ngx_str_t *password, ngx_str_t *nonce, time_t exp);
 
 #endif /* NGX_HTTP_PGP_AUTH_NONCE_H */

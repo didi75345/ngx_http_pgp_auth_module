@@ -56,8 +56,11 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
 | `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |
 | `pgp_auth_nonce_storage_address` | — | `host:port` of the Redis server (required for `redis`). |
+| `pgp_auth_nonce_storage_password` | — | Redis `AUTH` password (optional, `redis` only). Sent immediately after connecting; the `SET` is never issued if `AUTH` doesn't return `+OK`. |
+| `pgp_auth_nonce_zone_size` | `8m` | Size of the shared-memory zone for the `memory` nonce backend. Raise this for deployments with many concurrent logins; the zone fails closed (denies) when full rather than silently dropping replay protection. **This backs one shared-memory segment for the whole nginx config** (zones are identified by name, not per-location), so set it once -- e.g. at the `http` or `server` level -- rather than per-location; declaring different sizes for different locations makes `nginx -t` fail with a `"conflicts with already declared size"` error. |
 | `pgp_revocation_list` | — | File of revoked **primary** key fingerprints (one per line; `#` comments allowed). Spacing and case are ignored, so a fingerprint pasted straight from `gpg --fingerprint` works. Revokes the key and its live sessions; re-read on change, no reload. |
 | `pgp_revocation_fail_open` | `off` | Only applies when `pgp_revocation_list` is set: if that file can't be read, `off` denies access (fail closed), `on` allows. With no list configured, revocation is simply not in use and access is allowed. |
+| `pgp_gpg_path` | `/usr/bin/gpg` | Absolute path to the `gpg` binary. Must be absolute; the module `execve()`s it directly (no `$PATH` search, no inherited environment). |
 | `pgp_gpg_timeout` | `2s` | Max time for one gpg verification before it is killed. |
 | `pgp_auth_max_body_size` | `16k` | Reject a login body larger than this before reading it or spawning gpg. |
 
@@ -133,10 +136,6 @@ a bad signature.
   authenticate with a challenge we never issued.
 - Sessions are stateless. To revoke everyone, rotate `pgp_session_secret`. A key
   removed from the keyring is rejected at the next re-challenge.
-- A signer is identified by its **primary key fingerprint**, even when the
-  signature is made by a signing subkey. So a session is tied to the person's
-  primary key, and revoking that one fingerprint (via `pgp_revocation_list`)
-  covers every signature the key makes and survives subkey rotation.
 - **Single-use across nodes:** with `pgp_auth_nonce_storage none` — or `memory`,
   whose seen-nonce cache is per-node — a captured, already-signed challenge can
   be replayed within `pgp_challenge_timeout`, so keep it short and serve over

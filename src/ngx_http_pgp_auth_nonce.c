@@ -274,9 +274,47 @@ ngx_http_pgp_nonce_wait(int fd, short ev, int timeout_ms)
 }
 
 
+/*
+ * Send one RESP command and read one reply into `reply` (NUL-terminated).
+ * Returns the number of bytes read (>0) or -1 on error/timeout/closed.
+ */
+static ssize_t
+ngx_http_pgp_nonce_redis_roundtrip(int fd, const char *cmd, size_t cmdlen,
+    char *reply, size_t replysz)
+{
+    size_t   k;
+    ssize_t  w;
+
+    for (k = 0; k < cmdlen; ) {
+        if (ngx_http_pgp_nonce_wait(fd, POLLOUT,
+                                    NGX_HTTP_PGP_REDIS_TIMEOUT_MS) <= 0)
+        {
+            return -1;
+        }
+        w = send(fd, cmd + k, cmdlen - k, MSG_NOSIGNAL);
+        if (w <= 0) {
+            return -1;
+        }
+        k += (size_t) w;
+    }
+
+    if (ngx_http_pgp_nonce_wait(fd, POLLIN, NGX_HTTP_PGP_REDIS_TIMEOUT_MS)
+        <= 0)
+    {
+        return -1;
+    }
+    w = recv(fd, reply, replysz - 1, 0);
+    if (w <= 0) {
+        return -1;
+    }
+    reply[w] = '\0';
+    return w;
+}
+
+
 static ngx_int_t
 ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
-    ngx_str_t *nonce, time_t exp)
+    ngx_str_t *password, ngx_str_t *nonce, time_t exp)
 {
     int               fd = -1, err;
     long              ttl;
@@ -344,6 +382,26 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
         return NGX_ERROR;
     }
 
+    /*
+     * Authenticate first if a password is configured. A misconfigured or
+     * rejected AUTH must not fall through to an unauthenticated SET -- fail
+     * closed on anything other than a clean "+OK".
+     */
+    if (password->len) {
+        off = (size_t) (ngx_snprintf((u_char *) buf, sizeof(buf),
+            "*2\r\n$4\r\nAUTH\r\n$%uz\r\n%V\r\n",
+            password->len, password) - (u_char *) buf);
+
+        k = ngx_http_pgp_nonce_redis_roundtrip(fd, buf, off, reply,
+                                               sizeof(reply));
+        if (k <= 0 || reply[0] != '+') {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "pgp_auth: redis AUTH failed");
+            close(fd);
+            return NGX_ERROR;
+        }
+    }
+
     /* RESP: SET pgp:<nonce> 1 NX EX <ttl> */
     off = (size_t) (ngx_snprintf((u_char *) buf, sizeof(buf),
         "*6\r\n$3\r\nSET\r\n$%uz\r\npgp:%V\r\n$1\r\n1\r\n"
@@ -351,31 +409,11 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
         (size_t) (nonce->len + 4), nonce,
         ttl_len, ttl_len, ttlbuf) - (u_char *) buf);
 
-    for (k = 0; (size_t) k < off; ) {
-        ssize_t w;
-        if (ngx_http_pgp_nonce_wait(fd, POLLOUT,
-                                    NGX_HTTP_PGP_REDIS_TIMEOUT_MS) <= 0)
-        {
-            close(fd);
-            return NGX_ERROR;
-        }
-        w = send(fd, buf + k, off - k, MSG_NOSIGNAL);
-        if (w <= 0) { close(fd); return NGX_ERROR; }
-        k += w;
-    }
-
-    if (ngx_http_pgp_nonce_wait(fd, POLLIN, NGX_HTTP_PGP_REDIS_TIMEOUT_MS)
-        <= 0)
-    {
-        close(fd);
-        return NGX_ERROR;
-    }
-    k = recv(fd, reply, sizeof(reply) - 1, 0);
+    k = ngx_http_pgp_nonce_redis_roundtrip(fd, buf, off, reply, sizeof(reply));
     close(fd);
     if (k <= 0) {
         return NGX_ERROR;
     }
-    reply[k] = '\0';
 
     /* +OK => first use; $-1 / _ (nil) => key existed => replay */
     if (reply[0] == '+') {
@@ -390,7 +428,8 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
 
 ngx_int_t
 ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r, ngx_uint_t storage,
-    ngx_shm_zone_t *zone, ngx_str_t *addr, ngx_str_t *nonce, time_t exp)
+    ngx_shm_zone_t *zone, ngx_str_t *addr, ngx_str_t *password,
+    ngx_str_t *nonce, time_t exp)
 {
     switch (storage) {
 
@@ -398,7 +437,7 @@ ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r, ngx_uint_t storage,
         return ngx_http_pgp_nonce_memory(r, zone, nonce, exp);
 
     case NGX_HTTP_PGP_NONCE_REDIS:
-        return ngx_http_pgp_nonce_redis(r, addr, nonce, exp);
+        return ngx_http_pgp_nonce_redis(r, addr, password, nonce, exp);
 
     default:                                           /* NONE */
         return NGX_OK;

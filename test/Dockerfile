@@ -19,7 +19,7 @@ ENV NGINX_VERSION=${NGINX_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev \
-        gnupg curl ca-certificates \
+        gnupg curl ca-certificates redis-server \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . /src

@@ -73,12 +73,12 @@ Everything else (the keyring, the secret) is operator-controlled.
   An unreadable list **fails closed** (denies) by default
   (`pgp_revocation_fail_open off`). A signer is identified by its **primary key
   fingerprint** (gpg's `VALIDSIG` reports the signing-key fpr first and the
-  primary-key fpr last; the module keys identity and revocation off the primary).
-  This closes a bypass where a key that signs with a subkey would otherwise not
-  be caught by a revocation entry for its primary fingerprint, and keeps a user's
-  identity stable across subkey rotation. List entries are matched ignoring
-  whitespace and case, so a fingerprint pasted in `gpg --fingerprint` form
-  (spaced groups, mixed case) can't silently fail to match.
+  primary-key fpr last; the module keys identity and revocation off the primary),
+  which closes a bypass where a key that signs with a subkey would not be caught
+  by a revocation entry for its primary fingerprint, and keeps identity stable
+  across subkey rotation. List entries are matched ignoring whitespace and case,
+  so a fingerprint pasted in `gpg --fingerprint` form can't silently fail to
+  match.
 - **DoS resistance on the login endpoint** (unauthenticated): a body larger than
   `pgp_auth_max_body_size` (16k) is rejected before it is read; an HTTP/1.1
   *chunked* body (no declared length, which would otherwise be buffered to disk)
@@ -96,6 +96,42 @@ Everything else (the keyring, the secret) is operator-controlled.
 - **No trust in truncated gpg output**: if gpg's status or output overflows the
   read buffer it is treated as a failure, so a later `BADSIG`/`REVKEYSIG` marker
   cannot be lost past a `VALIDSIG`.
+- **No `$PATH` search, no inherited environment for the gpg child.** The child
+  is launched with `execve()` on the operator-configured absolute path
+  (`pgp_gpg_path`, validated at config time to start with `/`) and an empty
+  `envp`, not `execlp("gpg", ...)`. `execlp` resolves the binary by searching
+  `$PATH`, so anything placed earlier on the worker's `$PATH` -- or a `$PATH`
+  set via a poisoned environment -- would run in place of the real `gpg`.
+  Clearing the environment also removes `LD_PRELOAD`/`LD_LIBRARY_PATH`-style
+  injection via inherited variables. This closes off the one place in the
+  module where "no shell" alone would not have been enough.
+- **No fd leakage into the gpg child beyond a hardcoded bound.** The child
+  closes every inherited descriptor from 3 upward using `close_range()`
+  (Linux 5.9+) with a `sysconf(_SC_OPEN_MAX)`-based fallback, instead of a
+  fixed `< 1024` loop -- `worker_rlimit_nofile` is routinely raised well past
+  1024, and a fixed bound would leave higher-numbered fds (other client
+  connections, listening sockets, log fds) reachable to the gpg subprocess.
+- **Security headers on the login page.** `X-Frame-Options: DENY`,
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+  `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, and
+  `Referrer-Policy: no-referrer` are set on the challenge/login response, so
+  it can't be framed for clickjacking, MIME-sniffed, or cached.
+- **Redis `AUTH`** (`pgp_auth_nonce_storage_password`, optional): sent
+  immediately after connecting; the nonce `SET` is never issued unless `AUTH`
+  returns `+OK`, so a misconfigured or rejected password fails closed rather
+  than silently falling back to an unauthenticated write. Recommended for
+  any Redis instance reachable over a network rather than strictly local.
+- **Configurable nonce zone size** (`pgp_auth_nonce_zone_size`, default `8m`):
+  the `memory` nonce backend fails closed when full, so deployments expecting
+  many concurrent logins should size this up front rather than discover the
+  default under load. This sizes one shared-memory segment for the entire
+  nginx config (the zone is identified by name, not per-location), so set it
+  once -- at `http` or `server` level -- rather than differently per
+  location; nginx will refuse to start (`nginx -t` fails) if it sees the
+  same zone declared with two different sizes.
+- **Log output stripped of control characters**, not just newlines, before a
+  gpg failure message is logged -- gpg's own text can no longer inject escape
+  sequences into whatever reads the error log.
 
 ## Verification
 

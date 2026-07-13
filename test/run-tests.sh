@@ -78,7 +78,6 @@ gpg --batch --pinentry-mode loopback --passphrase '' \
 gpg --export subsigner@example.com >> "$WORK/pubkeys.gpg"   # append to keyring
 export GNUPGHOME="$WORK/gpg"
 echo "$SUBPRIMARY" > "$WORK/revoked-primary.txt"            # revoke by PRIMARY fpr
-
 # spaced + lowercased form of the main test key's fingerprint, as an operator
 # might paste it straight from `gpg --fingerprint` -- must still revoke.
 sed 's/..../& /g' "$WORK/revoked.txt" | tr 'A-F' 'a-f' > "$WORK/revoked-spaced.txt"
@@ -102,6 +101,12 @@ events { worker_connections 64; }
 http {
     server {
         listen $PORT;
+        # pgp_auth_nonce_zone_size backs a single shared-memory segment for
+        # the whole config (nginx shared zones are identified by name, not
+        # per-location), so it must be set the SAME way everywhere the
+        # memory backend is used -- setting it here means every location
+        # below inherits this one consistent value.
+        pgp_auth_nonce_zone_size 64k;
         location / {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
@@ -125,6 +130,20 @@ http {
             pgp_revocation_list $WORK/revoked.txt;
             root $WORK/html;
         }
+        location /revoc-subkey/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-primary.txt;
+            root $WORK/html;
+        }
+        location /revoc-spaced/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-spaced.txt;
+            root $WORK/html;
+        }
         location /failclosed/ {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
@@ -140,22 +159,6 @@ http {
             pgp_auth_nonce_storage none;
             root $WORK/html;
         }
-        location /revoc-spaced/ {
-            pgp_auth on;
-            pgp_keyring $WORK/pubkeys.gpg;
-            pgp_session_secret $WORK/session.key;
-            pgp_revocation_list $WORK/revoked-spaced.txt;
-            pgp_auth_nonce_storage none;
-            root $WORK/html;
-        }
-        location /revoc-subkey/ {
-            pgp_auth on;
-            pgp_keyring $WORK/pubkeys.gpg;
-            pgp_session_secret $WORK/session.key;
-            pgp_revocation_list $WORK/revoked-primary.txt;
-            pgp_auth_nonce_storage none;
-            root $WORK/html;
-        }
         location /basicauth/ {
             auth_basic "restricted";
             auth_basic_user_file $WORK/htpasswd;
@@ -165,12 +168,62 @@ http {
             pgp_auth_nonce_storage none;
             root $WORK/html;
         }
+        location /gpgpath/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_gpg_path /usr/bin/gpg;
+            root $WORK/html;
+        }
+        location /badgpgpath/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_gpg_path /nonexistent/gpg-does-not-exist;
+            root $WORK/html;
+        }
     }
 }
 EOF
 } > "$WORK/conf/nginx.conf"
 
 "$NGINX_BIN" -p "$WORK" -c conf/nginx.conf -t
+
+# --- config-time validation: pgp_gpg_path must be rejected if not absolute ---
+mkdir -p "$WORK/badconf"
+{
+    [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
+    cat <<EOF
+worker_processes 1;
+daemon off;
+error_log $WORK/badconf/error.log;
+pid $WORK/badconf/nginx.pid;
+events {}
+http {
+    server {
+        listen $((PORT + 50));
+        location / {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_gpg_path gpg;
+        }
+    }
+}
+EOF
+} > "$WORK/badconf/nginx.conf"
+if "$NGINX_BIN" -p "$WORK/badconf" -c nginx.conf -t >"$WORK/badconf/out" 2>&1; then
+    bad "relative pgp_gpg_path rejected at config time"
+else
+    if grep -qi 'pgp_gpg_path must be an absolute path' "$WORK/badconf/out"; then
+        ok "relative pgp_gpg_path rejected at config time"
+    else
+        ERRMSG="$(cat "$WORK/badconf/out")"
+        bad "relative pgp_gpg_path rejected (wrong error: $ERRMSG)"
+    fi
+fi
+
 "$NGINX_BIN" -p "$WORK" -c conf/nginx.conf &
 sleep 1
 
@@ -304,6 +357,43 @@ curl -s -X POST "$base/failclosed/?__pgp_auth=1" --data-urlencode "signed@$WORK/
 grep -qi '^set-cookie:' "$WORK/hfc" && bad "unreadable revocation list fails closed" \
     || ok "unreadable revocation list fails closed"
 
+# Subkey identity + revocation: a login signed by a SIGNING SUBKEY must be
+# identified by (and revocable through) the PRIMARY key fingerprint. Signing
+# happens in the subsigner's own gpg home.
+SUBHOME="$WORK/gpg3"
+curl -s "$base/" -o "$WORK/skp" >/dev/null
+SKCH="$(challenge "$WORK/skp")"
+printf '%s' "$SKCH" | GNUPGHOME="$SUBHOME" gpg --clearsign --batch \
+    --pinentry-mode loopback --passphrase '' > "$WORK/sks.asc" 2>/dev/null
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/sks.asc" \
+     -D "$WORK/hsk" -o /dev/null >/dev/null
+if grep -i '^set-cookie:' "$WORK/hsk" | grep -q "$SUBPRIMARY"; then
+    ok "subkey signature is identified by the primary key fingerprint"
+else
+    bad "subkey signer not bound to primary fpr"
+fi
+
+curl -s "$base/revoc-subkey/" -o "$WORK/skp2" >/dev/null
+SKCH2="$(challenge "$WORK/skp2")"
+printf '%s' "$SKCH2" | GNUPGHOME="$SUBHOME" gpg --clearsign --batch \
+    --pinentry-mode loopback --passphrase '' > "$WORK/sks2.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-subkey/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/sks2.asc" -D "$WORK/hsk2" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hsk2" \
+    && bad "subkey signature NOT revoked by primary fpr (revocation bypass)" \
+    || ok "revocation by primary fpr rejects a subkey signature"
+
+# Whitespace/case tolerance: a fingerprint pasted in `gpg --fingerprint` form
+# (spaced groups, lowercase) must still revoke.
+curl -s "$base/revoc-spaced/" -o "$WORK/spp" >/dev/null
+SPCH="$(challenge "$WORK/spp")"
+printf '%s' "$SPCH" | gpg --clearsign --batch > "$WORK/sps.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-spaced/?__pgp_auth=1" --data-urlencode "signed@$WORK/sps.asc" \
+     -D "$WORK/hsp" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hsp" \
+    && bad "spaced/lowercase fingerprint NOT revoked (normalization gap)" \
+    || ok "spaced/lowercase revocation entry still revokes"
+
 # Oversized auth body is rejected (413) before gpg is forked.
 head -c 40000 /dev/urandom | base64 > "$WORK/big"
 BC=$(curl -s -o /dev/null -X POST "$base/?__pgp_auth=1" \
@@ -382,46 +472,6 @@ else
     echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
 
-# Whitespace/case tolerance: a fingerprint pasted in `gpg --fingerprint` form
-# (spaced groups, lowercase) must still revoke -- a formatting difference must
-# not silently defeat revocation.
-curl -s "$base/revoc-spaced/" -o "$WORK/spp" >/dev/null
-SPCH="$(challenge "$WORK/spp")"
-printf '%s' "$SPCH" | gpg --clearsign --batch > "$WORK/sps.asc" 2>/dev/null
-curl -s -X POST "$base/revoc-spaced/?__pgp_auth=1" --data-urlencode "signed@$WORK/sps.asc" \
-     -D "$WORK/hsp" -o /dev/null >/dev/null
-grep -qi '^set-cookie:' "$WORK/hsp" \
-    && bad "spaced/lowercase fingerprint NOT revoked (normalization gap)" \
-    || ok "spaced/lowercase revocation entry still revokes"
-
-# Subkey identity + revocation: a login signed by a SIGNING SUBKEY must be
-# identified by (and revocable through) the PRIMARY key fingerprint. Signing
-# happens in the subsigner's own gpg home.
-SUBHOME="$WORK/gpg3"
-curl -s "$base/" -o "$WORK/skp" >/dev/null
-SKCH="$(challenge "$WORK/skp")"
-printf '%s' "$SKCH" | GNUPGHOME="$SUBHOME" gpg --clearsign --batch \
-    --pinentry-mode loopback --passphrase '' > "$WORK/sks.asc" 2>/dev/null
-curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/sks.asc" \
-     -D "$WORK/hsk" -o /dev/null >/dev/null
-# the granted cookie must carry the PRIMARY fpr, never the subkey fpr
-if grep -i '^set-cookie:' "$WORK/hsk" | grep -q "$SUBPRIMARY"; then
-    ok "subkey signature is identified by the primary key fingerprint"
-else
-    bad "subkey signer not bound to primary fpr"
-fi
-
-# now revoke by the PRIMARY fpr and confirm the subkey signature is rejected
-curl -s "$base/revoc-subkey/" -o "$WORK/skp2" >/dev/null
-SKCH2="$(challenge "$WORK/skp2")"
-printf '%s' "$SKCH2" | GNUPGHOME="$SUBHOME" gpg --clearsign --batch \
-    --pinentry-mode loopback --passphrase '' > "$WORK/sks2.asc" 2>/dev/null
-curl -s -X POST "$base/revoc-subkey/?__pgp_auth=1" \
-     --data-urlencode "signed@$WORK/sks2.asc" -D "$WORK/hsk2" -o /dev/null >/dev/null
-grep -qi '^set-cookie:' "$WORK/hsk2" \
-    && bad "subkey signature NOT revoked by primary fpr (revocation bypass)" \
-    || ok "revocation by primary fpr rejects a subkey signature"
-
 # SameSite: the /strict/ location sets pgp_session_cookie_samesite Strict, so a
 # successful login there must emit a cookie with SameSite=Strict.
 curl -s "$base/strict/" -o "$WORK/sp" >/dev/null
@@ -444,6 +494,143 @@ curl -s -u pgptest:pw "$base/basicauth/" -o "$WORK/bap" >/dev/null
 grep -q 'v1|' "$WORK/bap" \
     && ok "with basic creds, PGP challenge is served" \
     || bad "basic+pgp layered challenge"
+
+echo "== hardening added in this round =="
+
+# Security headers on the challenge/login page.
+curl -s "$base/" -D "$WORK/hdrs" -o /dev/null >/dev/null
+h() { grep -qi "^$1:" "$WORK/hdrs"; }
+if h 'X-Frame-Options' && h 'Content-Security-Policy' \
+   && h 'X-Content-Type-Options' && h 'Cache-Control' && h 'Referrer-Policy'
+then
+    ok "login page carries security headers"
+else
+    bad "login page security headers (got: $(tr -d '\r' < "$WORK/hdrs" | tr '\n' '|'))"
+fi
+grep -qi 'X-Frame-Options:.*DENY' "$WORK/hdrs" \
+    && ok "X-Frame-Options: DENY" || bad "X-Frame-Options value"
+grep -qi 'X-Content-Type-Options:.*nosniff' "$WORK/hdrs" \
+    && ok "X-Content-Type-Options: nosniff" || bad "X-Content-Type-Options value"
+grep -qi 'Cache-Control:.*no-store' "$WORK/hdrs" \
+    && ok "Cache-Control: no-store" || bad "Cache-Control value"
+
+# pgp_gpg_path with a correct absolute path: login must still work (execve
+# regression check -- this is the same code path that used to be execlp).
+curl -s "$base/gpgpath/" -o "$WORK/gpA" >/dev/null
+GPCH="$(challenge "$WORK/gpA")"
+printf '%s' "$GPCH" | gpg --clearsign --batch > "$WORK/gp.asc" 2>/dev/null
+curl -s -X POST "$base/gpgpath/?__pgp_auth=1" --data-urlencode "signed@$WORK/gp.asc" \
+     -D "$WORK/hgp" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hgp" \
+    && ok "pgp_gpg_path /usr/bin/gpg: login still works" \
+    || bad "pgp_gpg_path good-path login"
+
+# pgp_gpg_path pointing at a nonexistent binary: must fail *safely* (login
+# rejected, no crash, no 500) rather than falling back to a $PATH search.
+curl -s "$base/badgpgpath/" -o "$WORK/gpB" >/dev/null
+BGCH="$(challenge "$WORK/gpB")"
+printf '%s' "$BGCH" | gpg --clearsign --batch > "$WORK/bgp.asc" 2>/dev/null
+BGCODE=$(curl -s -o /dev/null -X POST "$base/badgpgpath/?__pgp_auth=1" \
+         --data-urlencode "signed@$WORK/bgp.asc" -D "$WORK/hbgp" -w '%{http_code}')
+{ [ "$BGCODE" != 500 ] && ! grep -qi '^set-cookie:' "$WORK/hbgp"; } \
+    && ok "nonexistent pgp_gpg_path fails safely (no crash, no auth bypass, got $BGCODE)" \
+    || bad "nonexistent pgp_gpg_path handling (got $BGCODE)"
+# nginx itself must still be alive after that.
+kill -0 "$(cat "$WORK/logs/nginx.pid")" 2>/dev/null \
+    && ok "nginx still running after bad pgp_gpg_path attempt" \
+    || bad "nginx survived bad pgp_gpg_path attempt"
+
+# pgp_auth_nonce_zone_size: the whole server block above runs on a custom
+# 64k zone (instead of the 8m default) -- if this were broken, the very
+# first "positive flow" test at the top (challenge -> login -> session) and
+# the "replay rejected" test would already have failed, since they all use
+# the "/" location under this same custom-sized zone. Restate that here
+# explicitly as its own pass/fail so a zone-size regression is easy to spot.
+curl -s "$base/" -o "$WORK/zp" >/dev/null
+ZCH="$(challenge "$WORK/zp")"
+printf '%s' "$ZCH" | gpg --clearsign --batch > "$WORK/z.asc" 2>/dev/null
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/z.asc" \
+     -D "$WORK/hz" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hz" \
+    && ok "custom pgp_auth_nonce_zone_size (64k): login works" \
+    || bad "custom pgp_auth_nonce_zone_size login"
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/z.asc" \
+     -D "$WORK/hz2" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hz2" \
+    && bad "custom pgp_auth_nonce_zone_size replay rejected" \
+    || ok "custom pgp_auth_nonce_zone_size replay rejected"
+
+# --- Redis nonce backend + AUTH (only if redis-server is available) --------
+if command -v redis-server >/dev/null 2>&1; then
+    RPORT=$((PORT + 60))
+    redis-server --port "$RPORT" --requirepass redispw --daemonize no \
+        --logfile "$WORK/logs/redis.log" --dir "$WORK" &
+    REDISPID=$!
+    sleep 1
+
+    {
+        [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
+        [ "$(id -u)" = 0 ] && echo "user root;"
+        cat <<EOF
+worker_processes 1; daemon off; error_log $WORK/logs/redis-nginx.log info;
+pid $WORK/logs/redis-nginx.pid;
+events { worker_connections 32; }
+http { server {
+    listen $((PORT + 61));
+    location /redisok/ {
+        pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+        pgp_session_secret $WORK/session.key;
+        pgp_auth_nonce_storage redis;
+        pgp_auth_nonce_storage_address 127.0.0.1:$RPORT;
+        pgp_auth_nonce_storage_password redispw;
+        root $WORK/html;
+    }
+    location /redisbad/ {
+        pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+        pgp_session_secret $WORK/session.key;
+        pgp_auth_nonce_storage redis;
+        pgp_auth_nonce_storage_address 127.0.0.1:$RPORT;
+        pgp_auth_nonce_storage_password wrongpassword;
+        root $WORK/html;
+    }
+} }
+EOF
+    } > "$WORK/conf/redis.conf"
+    "$NGINX_BIN" -p "$WORK" -c conf/redis.conf &
+    sleep 1
+    rbase="http://127.0.0.1:$((PORT + 61))"
+
+    # correct password: login succeeds and single-use is enforced via Redis.
+    curl -s "$rbase/redisok/" -o "$WORK/rok" >/dev/null
+    ROKCH="$(challenge "$WORK/rok")"
+    printf '%s' "$ROKCH" | gpg --clearsign --batch > "$WORK/rok.asc" 2>/dev/null
+    curl -s -X POST "$rbase/redisok/?__pgp_auth=1" --data-urlencode "signed@$WORK/rok.asc" \
+         -D "$WORK/hrok" -o /dev/null >/dev/null
+    grep -qi '^set-cookie:' "$WORK/hrok" \
+        && ok "redis backend with correct AUTH: login works" \
+        || bad "redis backend correct AUTH login"
+    curl -s -X POST "$rbase/redisok/?__pgp_auth=1" --data-urlencode "signed@$WORK/rok.asc" \
+         -D "$WORK/hrok2" -o /dev/null >/dev/null
+    grep -qi '^set-cookie:' "$WORK/hrok2" \
+        && bad "redis backend replay rejected" \
+        || ok "redis backend replay rejected (cross-checked against Redis)"
+
+    # wrong password: AUTH must fail closed -- login rejected, not silently
+    # allowed via an unauthenticated SET.
+    curl -s "$rbase/redisbad/" -o "$WORK/rbad" >/dev/null
+    RBADCH="$(challenge "$WORK/rbad")"
+    printf '%s' "$RBADCH" | gpg --clearsign --batch > "$WORK/rbad.asc" 2>/dev/null
+    curl -s -X POST "$rbase/redisbad/?__pgp_auth=1" --data-urlencode "signed@$WORK/rbad.asc" \
+         -D "$WORK/hrbad" -o /dev/null >/dev/null
+    grep -qi '^set-cookie:' "$WORK/hrbad" \
+        && bad "redis backend wrong AUTH fails closed" \
+        || ok "redis backend wrong AUTH fails closed"
+
+    [ -f "$WORK/logs/redis-nginx.pid" ] && kill "$(cat "$WORK/logs/redis-nginx.pid")" 2>/dev/null
+    kill "$REDISPID" 2>/dev/null || true
+else
+    echo "  SKIP  redis backend + AUTH tests (redis-server not installed)"
+fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
