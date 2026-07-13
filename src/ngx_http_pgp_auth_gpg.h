@@ -17,7 +17,7 @@
 
 typedef struct {
     ngx_int_t  valid;            /* 1 if a good signature from a keyring key */
-    u_char     fpr[80];          /* hex fingerprint of the signing key       */
+    u_char     fpr[80];          /* hex fpr of the signer's PRIMARY key       */
     size_t     fpr_len;
 
     /*

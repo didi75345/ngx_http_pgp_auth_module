@@ -71,7 +71,12 @@ Everything else (the keyring, the secret) is operator-controlled.
 - **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
   and all of its live sessions without rotating the secret or reloading nginx.
   An unreadable list **fails closed** (denies) by default
-  (`pgp_revocation_fail_open off`).
+  (`pgp_revocation_fail_open off`). A signer is identified by its **primary key
+  fingerprint** (gpg's `VALIDSIG` reports the signing-key fpr first and the
+  primary-key fpr last; the module keys identity and revocation off the primary).
+  This closes a bypass where a key that signs with a subkey would otherwise not
+  be caught by a revocation entry for its primary fingerprint, and keeps a user's
+  identity stable across subkey rotation.
 - **DoS resistance on the login endpoint** (unauthenticated): a body larger than
   `pgp_auth_max_body_size` (16k) is rejected before it is read; an HTTP/1.1
   *chunked* body (no declared length, which would otherwise be buffered to disk)
