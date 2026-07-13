@@ -56,7 +56,7 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
 | `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |
 | `pgp_auth_nonce_storage_address` | — | `host:port` of the Redis server (required for `redis`). |
-| `pgp_revocation_list` | — | File of revoked **primary** key fingerprints (one per line). Revokes the key and its live sessions; re-read on change, no reload. |
+| `pgp_revocation_list` | — | File of revoked **primary** key fingerprints (one per line; `#` comments allowed). Spacing and case are ignored, so a fingerprint pasted straight from `gpg --fingerprint` works. Revokes the key and its live sessions; re-read on change, no reload. |
 | `pgp_revocation_fail_open` | `off` | Only applies when `pgp_revocation_list` is set: if that file can't be read, `off` denies access (fail closed), `on` allows. With no list configured, revocation is simply not in use and access is allowed. |
 | `pgp_gpg_timeout` | `2s` | Max time for one gpg verification before it is killed. |
 | `pgp_auth_max_body_size` | `16k` | Reject a login body larger than this before reading it or spawning gpg. |

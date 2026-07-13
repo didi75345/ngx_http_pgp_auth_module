@@ -79,6 +79,10 @@ gpg --export subsigner@example.com >> "$WORK/pubkeys.gpg"   # append to keyring
 export GNUPGHOME="$WORK/gpg"
 echo "$SUBPRIMARY" > "$WORK/revoked-primary.txt"            # revoke by PRIMARY fpr
 
+# spaced + lowercased form of the main test key's fingerprint, as an operator
+# might paste it straight from `gpg --fingerprint` -- must still revoke.
+sed 's/..../& /g' "$WORK/revoked.txt" | tr 'A-F' 'a-f' > "$WORK/revoked-spaced.txt"
+
 # htpasswd for the auth_basic ordering test (user pgptest / pass pw)
 printf '%s\n' 'pgptest:$apr1$abcd1234$UEURWw71lGBk.LwDG1Xr4/' > "$WORK/htpasswd"
 
@@ -133,6 +137,14 @@ http {
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_session_cookie_samesite Strict;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+        location /revoc-spaced/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-spaced.txt;
             pgp_auth_nonce_storage none;
             root $WORK/html;
         }
@@ -369,6 +381,18 @@ EOF
 else
     echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
+
+# Whitespace/case tolerance: a fingerprint pasted in `gpg --fingerprint` form
+# (spaced groups, lowercase) must still revoke -- a formatting difference must
+# not silently defeat revocation.
+curl -s "$base/revoc-spaced/" -o "$WORK/spp" >/dev/null
+SPCH="$(challenge "$WORK/spp")"
+printf '%s' "$SPCH" | gpg --clearsign --batch > "$WORK/sps.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-spaced/?__pgp_auth=1" --data-urlencode "signed@$WORK/sps.asc" \
+     -D "$WORK/hsp" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hsp" \
+    && bad "spaced/lowercase fingerprint NOT revoked (normalization gap)" \
+    || ok "spaced/lowercase revocation entry still revokes"
 
 # Subkey identity + revocation: a login signed by a SIGNING SUBKEY must be
 # identified by (and revocable through) the PRIMARY key fingerprint. Signing

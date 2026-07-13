@@ -76,7 +76,9 @@ Everything else (the keyring, the secret) is operator-controlled.
   primary-key fpr last; the module keys identity and revocation off the primary).
   This closes a bypass where a key that signs with a subkey would otherwise not
   be caught by a revocation entry for its primary fingerprint, and keeps a user's
-  identity stable across subkey rotation.
+  identity stable across subkey rotation. List entries are matched ignoring
+  whitespace and case, so a fingerprint pasted in `gpg --fingerprint` form
+  (spaced groups, mixed case) can't silently fail to match.
 - **DoS resistance on the login endpoint** (unauthenticated): a body larger than
   `pgp_auth_max_body_size` (16k) is rejected before it is read; an HTTP/1.1
   *chunked* body (no declared length, which would otherwise be buffered to disk)

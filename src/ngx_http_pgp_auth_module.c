@@ -332,6 +332,31 @@ ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
 
 
 /*
+ * Compare a revocation-list entry [a, ae) against a fingerprint, ignoring
+ * ASCII whitespace in the entry and case on both sides. This tolerates the
+ * spaced, mixed-case form that `gpg --fingerprint` prints (e.g. "ABCD 1234
+ * ...") so a mere formatting difference cannot silently defeat revocation.
+ */
+static ngx_int_t
+ngx_http_pgp_fpr_eq(u_char *a, u_char *ae, ngx_str_t *fpr)
+{
+    u_char  *b, *be;
+
+    b = fpr->data;
+    be = fpr->data + fpr->len;
+
+    while (a < ae) {
+        if (*a == ' ' || *a == '\t') { a++; continue; }
+        if (b == be) { return 0; }                  /* entry longer than fpr */
+        if (ngx_tolower(*a) != ngx_tolower(*b)) { return 0; }
+        a++;
+        b++;
+    }
+    return (b == be) ? 1 : 0;                        /* all fpr chars matched */
+}
+
+
+/*
  * Is `fpr` listed in the revocation file? The file holds one key fingerprint
  * per line (# comments and blank lines ignored); case-insensitive. The file is
  * re-read only when its mtime changes, so an operator can revoke a key (or all
@@ -412,8 +437,7 @@ ngx_http_pgp_is_revoked(ngx_http_request_t *r,
         while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) { e--; }
 
         if (s < e && *s != '#'
-            && (size_t) (e - s) == fpr->len
-            && ngx_strncasecmp(s, fpr->data, fpr->len) == 0)
+            && ngx_http_pgp_fpr_eq(s, e, fpr))
         {
             return 1;
         }
