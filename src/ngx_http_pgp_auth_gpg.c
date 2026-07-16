@@ -27,6 +27,10 @@
 /* Upper bound on a single gpg verification before it is killed. */
 #define NGX_HTTP_PGP_GPG_TIMEOUT_MS  5000
 
+/* stringize a numeric macro so it can be passed as a gpg command-line arg */
+#define ngx_http_pgp_str2(x)       #x
+#define ngx_http_pgp_stringize(x)  ngx_http_pgp_str2(x)
+
 
 static int64_t
 ngx_http_pgp_now_ms(void)
@@ -75,12 +79,15 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     int          pfd[2], fd, status;
     ssize_t      n;
     size_t       off;
-    char         home[] = "/tmp/ngx_pgp_XXXXXX";
+    char         home[PATH_MAX];
+    const char  *tmpdir;
     char         msgpath[PATH_MAX];
     char         plainpath[PATH_MAX];
     char         keyringz[PATH_MAX];
     char         gpgz[PATH_MAX];
     char         out[8192];
+    char         parsebuf[8192];   /* strtok_r scratch; keeps `out` intact for logs */
+    size_t       outlen;           /* status bytes in `out` (off is reused below) */
     char        *p, *line, *save;
     int64_t      deadline;
     ngx_int_t    good, bad, truncated;
@@ -119,6 +126,21 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     }
     ngx_memcpy(gpgz, gpg_path->data, gpg_path->len);
     gpgz[gpg_path->len] = '\0';
+
+    /*
+     * Create the throwaway keyring dir under $TMPDIR when set (an absolute
+     * path), else /tmp -- matching the documented "system temp dir" rather
+     * than always hardcoding /tmp. gpg itself runs with an empty environment
+     * and an absolute --homedir, so it does not depend on TMPDIR.
+     */
+    tmpdir = getenv("TMPDIR");
+    if (tmpdir == NULL || tmpdir[0] != '/'
+        || ngx_strlen(tmpdir) > sizeof(home) - sizeof("/ngx_pgp_XXXXXX"))
+    {
+        tmpdir = "/tmp";
+    }
+    (void) ngx_snprintf((u_char *) home, sizeof(home), "%s/ngx_pgp_XXXXXX%Z",
+                        tmpdir);
 
     if (mkdtemp(home) == NULL) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
@@ -231,6 +253,17 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
                 "--keyring", keyringz,
                 "--status-fd", "1",
                 "--output", plainpath,
+                /*
+                 * Cap what gpg will write. --decrypt also inflates compressed
+                 * OpenPGP packets, so without this a small (<=16k) but highly
+                 * compressed body could make gpg write a huge file to the temp
+                 * dir before the timeout -- a data-amplification DoS, worst on
+                 * the small tmpfs /tmp common in containers. The verified
+                 * plaintext we care about (a signed challenge) is a few hundred
+                 * bytes; NGX_HTTP_PGP_PLAINTEXT_MAX is a generous ceiling and
+                 * matches the buffer we read it into.
+                 */
+                "--max-output", ngx_http_pgp_stringize(NGX_HTTP_PGP_PLAINTEXT_MAX),
                 "--batch", "--no-tty", "--yes",
                 "--no-autostart",   /* signature verify needs no gpg-agent */
                 "--decrypt", msgpath,
@@ -301,6 +334,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
         break;
     }
     out[off] = '\0';
+    outlen = off;                  /* remember it: `off` is reused for plaintext */
     close(pfd[0]);
 
     while (waitpid(pid, &status, 0) == -1 && ngx_errno == NGX_EINTR) {
@@ -344,7 +378,13 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
      */
     good = 0;
     bad = 0;
-    for (line = strtok_r(out, "\n", &save);
+    /*
+     * strtok_r rewrites its input (each '\n' -> '\0'), which would truncate the
+     * error log below to gpg's first line only. Parse a COPY and keep `out`
+     * intact so the failure log can show gpg's full message.
+     */
+    ngx_memcpy(parsebuf, out, outlen + 1);         /* includes the '\0' at out[outlen] */
+    for (line = strtok_r(parsebuf, "\n", &save);
          line != NULL;
          line = strtok_r(NULL, "\n", &save))
     {

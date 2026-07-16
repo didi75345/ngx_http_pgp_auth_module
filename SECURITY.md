@@ -131,7 +131,35 @@ Everything else (the keyring, the secret) is operator-controlled.
   same zone declared with two different sizes.
 - **Log output stripped of control characters**, not just newlines, before a
   gpg failure message is logged -- gpg's own text can no longer inject escape
-  sequences into whatever reads the error log.
+  sequences into whatever reads the error log. The full message is preserved
+  (parsing is done on a copy), so an operator sees all of gpg's output, not
+  just its first line.
+- **MAC domain separation.** Every MAC input is prefixed with a context label
+  (`chal` for a challenge, `sess` for a session cookie), so the two token types
+  can never produce the same MAC regardless of how their pipe-delimited layouts
+  or parsers later evolve. This makes "a challenge can't be presented as a
+  session cookie" a cryptographic invariant rather than a property of the
+  current parser field counts.
+- **Bounded gpg output** (`--max-output`). `--decrypt` also inflates compressed
+  OpenPGP packets, so a small but highly compressed body could otherwise make
+  gpg write a huge file to the temp dir (a data-amplification DoS, worst on the
+  small tmpfs `/tmp` in containers). gpg is capped with `--max-output`, and the
+  clear-sign pre-check now requires the header at the very *start* of the body
+  (not merely somewhere inside it), so a compressed packet can't be prepended
+  ahead of a real header.
+- **No blocking DNS on the login path.** The Redis nonce client resolves its
+  address with no DNS lookup (numeric `ip:port` only); a hostname with a slow or
+  unreachable resolver would otherwise hang the worker for the system resolver's
+  timeout, uncovered by the client's own per-operation deadlines.
+- **Redis errors are not mistaken for replays.** A Redis error reply (`-NOAUTH`,
+  `-LOADING`, `-OOM`, ...) is treated as an operational failure -- logged and
+  denied deliberately (fail closed) -- not silently labelled "challenge already
+  used", so a Redis outage is diagnosable instead of looking like a flood of
+  replays.
+- **Weak-secret warning.** The secret loader warns at start-up if the HMAC
+  secret is shorter than 16 bytes; it keys every token MAC, so a guessable
+  secret is a full bypass. `$TMPDIR` is honoured for the throwaway keyring dir,
+  matching the documented "system temp dir".
 
 ## Verification
 

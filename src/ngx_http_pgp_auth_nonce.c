@@ -343,12 +343,23 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
     }
     *colon = '\0';
 
+    /*
+     * AI_NUMERICHOST|AI_NUMERICSERV: parse the address as a literal IP and
+     * port only -- never consult DNS. getaddrinfo() is otherwise a *blocking*
+     * call with no timeout, run inside the nginx worker on an unauthenticated
+     * login path: a hostname whose DNS is slow or unreachable would hang the
+     * worker for the system resolver's timeout, uncovered by the per-op poll
+     * deadlines below or by limit_req. So pgp_auth_nonce_storage_address must
+     * be a numeric host:port (e.g. 10.0.0.5:6379); resolution is instant.
+     */
     ngx_memzero(&hints, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
     if (getaddrinfo(host, colon + 1, &hints, &ai) != 0) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "pgp_auth: redis getaddrinfo(%s) failed", host);
+                      "pgp_auth: redis address \"%s\" is not a numeric host:port "
+                      "(hostnames are not supported; use an IP)", host);
         return NGX_ERROR;
     }
 
@@ -415,12 +426,28 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
         return NGX_ERROR;
     }
 
-    /* +OK => first use; $-1 / _ (nil) => key existed => replay */
+    /*
+     * +OK               => SET succeeded, first use of this nonce => allow.
+     * $-1 (RESP2 nil) /
+     * _   (RESP3 null)  => NX found the key => nonce already used => replay.
+     * -...              => a Redis ERROR reply (-NOAUTH, -LOADING, -OOM, ...).
+     *                      This is an operational failure, NOT a replay: report
+     *                      it as an error so it is logged as such and denied
+     *                      deliberately (fail closed), rather than being
+     *                      mislabelled "challenge already used" in the log,
+     *                      which would send an operator hunting the wrong thing
+     *                      during a Redis outage.
+     */
     if (reply[0] == '+') {
         return NGX_OK;
     }
-    if (reply[0] == '$' || reply[0] == '_' || reply[0] == '-') {
+    if (reply[0] == '$' || reply[0] == '_') {
         return NGX_DECLINED;
+    }
+    if (reply[0] == '-') {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "pgp_auth: redis error reply: %s", reply);
+        return NGX_ERROR;
     }
     return NGX_ERROR;
 }

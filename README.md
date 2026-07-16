@@ -48,14 +48,14 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_keyring` | `/etc/nginx/pubkeys.gpg` | Public keyring of allowed signers (absolute path). |
 | `pgp_session_secret` | *(random)* | File with the HMAC secret. **Set this** for multi-node / restart-stable sessions. |
 | `pgp_challenge_timeout` | `120s` | How long an issued challenge stays valid. |
-| `pgp_session_timeout` | `1h` | Re-challenge interval. `0` = unlimited. |
+| `pgp_session_timeout` | `1h` | Re-challenge interval. `0` = unlimited (the cookie never expires — a leaked/captured cookie then only ends via `pgp_revocation_list` or rotating the secret; keep a finite value unless you have a specific reason not to). |
 | `pgp_session_cookie_secure` | `on` | Add `; Secure` to the session cookie. Set `off` for a plain-HTTP deployment (e.g. one already behind an encrypted transport). |
 | `pgp_session_cookie_host_prefix` | `on` | Use the `__Host-` cookie name prefix. The prefix requires Secure, so it is applied only when `pgp_session_cookie_secure` is on; with Secure off it is dropped (nginx warns) so the cookie stays usable. |
 | `pgp_session_cookie_samesite` | `Lax` | `SameSite` attribute on the session cookie: `Lax`, `Strict`, or `None`. `None` requires `pgp_session_cookie_secure` on. |
 | `pgp_auth_bind_client_ip` | `on` | Fold the client IP into the token, blocking cross-IP replay. Behind a proxy, configure `ngx_http_realip_module`. |
 | `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
 | `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |
-| `pgp_auth_nonce_storage_address` | — | `host:port` of the Redis server (required for `redis`). |
+| `pgp_auth_nonce_storage_address` | — | `ip:port` of the Redis server (required for `redis`). Must be a **numeric IP**, not a hostname: resolution is done with no DNS lookup, so a slow/unreachable resolver can't block the worker on the login path. |
 | `pgp_auth_nonce_storage_password` | — | Redis `AUTH` password (optional, `redis` only). Sent immediately after connecting; the `SET` is never issued if `AUTH` doesn't return `+OK`. |
 | `pgp_auth_nonce_zone_size` | `8m` | Size of the shared-memory zone for the `memory` nonce backend. Raise this for deployments with many concurrent logins; the zone fails closed (denies) when full rather than silently dropping replay protection. **This backs one shared-memory segment for the whole nginx config** (zones are identified by name, not per-location), so set it once -- e.g. at the `http` or `server` level -- rather than per-location; declaring different sizes for different locations makes `nginx -t` fail with a `"conflicts with already declared size"` error. |
 | `pgp_revocation_list` | — | File of revoked **primary** key fingerprints (one per line; `#` comments allowed). Spacing and case are ignored, so a fingerprint pasted straight from `gpg --fingerprint` works. Revokes the key and its live sessions; re-read on change, no reload. |
@@ -67,7 +67,10 @@ So out of the box it is stateless apart from a local single-use cache; pick
 All directives are valid at `http`, `server`, and `location` scope.
 
 Because the login endpoint is unauthenticated and each attempt spawns gpg,
-**rate-limit it** with nginx's `limit_req` — see `examples/nginx.conf`.
+**rate-limit it** with nginx's `limit_req` — see `examples/nginx.conf`. Also set
+`client_max_body_size` on the protected location to match the module's
+`pgp_auth_max_body_size` cap (16k), so an HTTP/2 request with no declared length
+can't be buffered larger than intended before the module's own cap applies.
 
 ```nginx
 location / {
