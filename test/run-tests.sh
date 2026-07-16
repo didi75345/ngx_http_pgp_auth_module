@@ -285,6 +285,29 @@ curl -s -H 'Cookie: pgp_session=9999999999|DEADBEEF|ffffffffffffffffffffffffffff
      "$base/" -o "$WORK/n1" >/dev/null
 grep -q 'SECRET-OK' "$WORK/n1" && bad "forged cookie blocked" || ok "forged cookie blocked"
 
+# Domain separation (F-006): a valid, freely obtainable CHALLENGE token must not
+# work as a SESSION cookie. Both are HMACs over the same secret, but each MAC
+# input carries a distinct context label ("chal" vs "sess"), so a challenge can
+# never validate as a session regardless of how the parsers slice the fields.
+curl -s "$base/" -o "$WORK/dsp" >/dev/null
+DSCH="$(challenge "$WORK/dsp")"
+curl -s -H "Cookie: __Host-pgp_session=$DSCH" "$base/" -o "$WORK/ds1" >/dev/null
+grep -q 'SECRET-OK' "$WORK/ds1" \
+    && bad "challenge cannot be presented as a session cookie (domain separation)" \
+    || ok "challenge cannot be presented as a session cookie (domain separation)"
+
+# Pre-check (F-003): a body with content BEFORE the clear-sign header must be
+# rejected up front, so a compressed packet can't be prepended ahead of it.
+curl -s "$base/" -o "$WORK/pcp" >/dev/null
+PCCH="$(challenge "$WORK/pcp")"
+printf '%s' "$PCCH" | gpg --clearsign --batch > "$WORK/pcs.asc" 2>/dev/null
+{ printf 'prepended junk\n'; cat "$WORK/pcs.asc"; } > "$WORK/pcbad.asc"
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/pcbad.asc" \
+     -D "$WORK/hpc" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hpc" \
+    && bad "body with content before the clear-sign header rejected" \
+    || ok "body with content before the clear-sign header rejected"
+
 export GNUPGHOME="$WORK/gpg2"
 printf '%s' "$CH" | gpg --clearsign --batch > "$WORK/evil.asc" 2>/dev/null
 export GNUPGHOME="$WORK/gpg"

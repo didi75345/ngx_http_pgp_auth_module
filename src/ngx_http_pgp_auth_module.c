@@ -95,8 +95,8 @@ static ngx_int_t ngx_http_pgp_auth_handler(ngx_http_request_t *r);
 static void ngx_http_pgp_auth_submit(ngx_http_request_t *r);
 
 static ngx_int_t ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
-    ngx_http_pgp_auth_loc_conf_t *plcf, u_char *data, size_t len,
-    ngx_str_t *out);
+    ngx_http_pgp_auth_loc_conf_t *plcf, const char *kind, u_char *data,
+    size_t len, ngx_str_t *out);
 static ngx_int_t ngx_http_pgp_ct_eq(ngx_str_t *a, ngx_str_t *b);
 
 static ngx_int_t ngx_http_pgp_check_session(ngx_http_request_t *r,
@@ -299,14 +299,14 @@ ngx_module_t  ngx_http_pgp_auth_module = {
  */
 static ngx_int_t
 ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
-    ngx_http_pgp_auth_loc_conf_t *plcf, u_char *data, size_t len,
-    ngx_str_t *out)
+    ngx_http_pgp_auth_loc_conf_t *plcf, const char *kind, u_char *data,
+    size_t len, ngx_str_t *out)
 {
     unsigned int   mdlen;
     unsigned char  md[EVP_MAX_MD_SIZE];
     ngx_str_t      ip, ua;
     u_char        *buf, *b;
-    size_t         total;
+    size_t         klen, total;
 
     ngx_str_null(&ip);
     ngx_str_null(&ua);
@@ -318,30 +318,35 @@ ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
         ua = r->headers_in.user_agent->value;
     }
 
-    if (ip.len == 0 && ua.len == 0) {
-        if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
-                 data, len, md, &mdlen) == NULL)
-        {
-            return NGX_ERROR;
-        }
-    } else {
-        /* data || 0x1e || ip || 0x1e || ua */
-        total = len + 1 + ip.len + 1 + ua.len;
-        buf = ngx_pnalloc(r->pool, total);
-        if (buf == NULL) {
-            return NGX_ERROR;
-        }
-        b = ngx_cpymem(buf, data, len);
-        *b++ = 0x1e;
-        b = ngx_cpymem(b, ip.data, ip.len);
-        *b++ = 0x1e;
-        ngx_memcpy(b, ua.data, ua.len);
+    /*
+     * Domain separation: every MAC input is prefixed with a context label
+     * ("chal" for a challenge, "sess" for a session cookie), so the two token
+     * types can never produce the same MAC regardless of how their
+     * pipe-delimited layouts or parsers later evolve. Otherwise both are just
+     * HMAC(secret, <differently-shaped-but-unlabelled data>), and a future
+     * format change could let a freely obtainable challenge validate as a
+     * session cookie -- a full auth bypass. This is the invariant, not the
+     * parsers' current field counts, that keeps them apart.
+     *   layout: kind || 0x1e || data || 0x1e || ip || 0x1e || ua
+     */
+    klen = ngx_strlen(kind);
+    total = klen + 1 + len + 1 + ip.len + 1 + ua.len;
+    buf = ngx_pnalloc(r->pool, total);
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+    b = ngx_cpymem(buf, (u_char *) kind, klen);
+    *b++ = 0x1e;
+    b = ngx_cpymem(b, data, len);
+    *b++ = 0x1e;
+    b = ngx_cpymem(b, ip.data, ip.len);
+    *b++ = 0x1e;
+    ngx_memcpy(b, ua.data, ua.len);
 
-        if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
-                 buf, total, md, &mdlen) == NULL)
-        {
-            return NGX_ERROR;
-        }
+    if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
+             buf, total, md, &mdlen) == NULL)
+    {
+        return NGX_ERROR;
     }
 
     out->data = ngx_pnalloc(r->pool, mdlen * 2);
@@ -565,7 +570,7 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
     mac_have.data = sep2 + 1;
     mac_have.len = last - (sep2 + 1);
 
-    if (ngx_http_pgp_hmac_hex(r, plcf, payload.data, payload.len,
+    if (ngx_http_pgp_hmac_hex(r, plcf, "sess", payload.data, payload.len,
                               &mac_want) != NGX_OK)
     {
         return NGX_DECLINED;
@@ -618,11 +623,31 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
      * clear-signed block. Garbage submissions are rejected here, before the
      * (blocking) gpg process is ever spawned -- important given this endpoint
      * is unauthenticated. Pair with limit_req (see examples/nginx.conf).
+     *
+     * Require the header at the very START of the body (after optional leading
+     * whitespace), not merely somewhere inside it. A genuine clearsigned
+     * message begins with this line; requiring it up front stops an attacker
+     * from prepending a compressed OpenPGP packet ahead of it, which gpg
+     * --decrypt would otherwise inflate. Together with gpg's --max-output cap
+     * this bounds the data-amplification surface.
      */
-    if (ngx_strnstr(msg, "-----BEGIN PGP SIGNED MESSAGE-----", len) == NULL) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "pgp_auth: submission is not a clear-signed message");
-        return NGX_DECLINED;
+    {
+        static const u_char  hdr[] = "-----BEGIN PGP SIGNED MESSAGE-----";
+        u_char              *q = msg;
+        u_char              *mend = msg + len;
+
+        while (q < mend
+               && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n'))
+        {
+            q++;
+        }
+        if ((size_t) (mend - q) < sizeof(hdr) - 1
+            || ngx_strncmp(q, hdr, sizeof(hdr) - 1) != 0)
+        {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "pgp_auth: submission is not a clear-signed message");
+            return NGX_DECLINED;
+        }
     }
 
     if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->gpg_path,
@@ -680,7 +705,7 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
     mac_have.data = s3 + 1;
     mac_have.len = line_end - (s3 + 1);
 
-    if (ngx_http_pgp_hmac_hex(r, plcf, payload.data, payload.len,
+    if (ngx_http_pgp_hmac_hex(r, plcf, "chal", payload.data, payload.len,
                               &mac_want) != NGX_OK)
     {
         return NGX_ERROR;
@@ -751,7 +776,7 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     }
     plen = ngx_sprintf(payload, "%T|%V", exp, fpr) - payload;
 
-    if (ngx_http_pgp_hmac_hex(r, plcf, payload, plen, &mac) != NGX_OK) {
+    if (ngx_http_pgp_hmac_hex(r, plcf, "sess", payload, plen, &mac) != NGX_OK) {
         return NGX_ERROR;
     }
 
@@ -852,7 +877,7 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
     plen = ngx_sprintf(payload, "v1|%T|%*s", exp,
                        sizeof(nonce_hex), nonce_hex) - payload;
 
-    if (ngx_http_pgp_hmac_hex(r, plcf, payload, plen, &mac)
+    if (ngx_http_pgp_hmac_hex(r, plcf, "chal", payload, plen, &mac)
         != NGX_OK)
     {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1258,6 +1283,17 @@ ngx_http_pgp_load_secret(ngx_conf_t *cf, ngx_str_t *path, ngx_str_t *out)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "pgp_auth: secret file \"%V\" has no content", path);
         return NGX_ERROR;
+    }
+
+    /*
+     * Warn on a short/weak secret. This keys every session and challenge MAC;
+     * a guessable secret is a full auth bypass. 16 bytes (128 bits) is the
+     * floor; the shipped generator (scripts/gen-secret.sh) produces 32+.
+     */
+    if ((size_t) n < 16) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "pgp_auth: secret file \"%V\" is only %z bytes; use at least 16 "
+            "(scripts/gen-secret.sh produces a strong secret)", path, (size_t) n);
     }
 
     out->data = buf;
