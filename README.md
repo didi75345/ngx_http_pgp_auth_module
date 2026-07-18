@@ -66,8 +66,12 @@ So out of the box it is stateless apart from a local single-use cache; pick
 
 All directives are valid at `http`, `server`, and `location` scope.
 
-Because the login endpoint is unauthenticated and each attempt spawns gpg,
-**rate-limit it** with nginx's `limit_req` — see `examples/nginx.conf`. Also set
+The login endpoint is unauthenticated and a submission forks a gpg verification,
+which occupies a worker for ~17–25 ms. **Rate-limiting it with `limit_req` is
+required, not optional** — and the limit should be keyed **globally**, not only
+per-IP, or a distributed attempt still gets an allowance per source address.
+`examples/nginx.conf` shows the full pattern; [SECURITY.md](SECURITY.md) has the
+measured per-request costs and the sizing arithmetic. Also set
 `client_max_body_size` on the protected location to match the module's
 `pgp_auth_max_body_size` cap (16k), so an HTTP/2 request with no declared length
 can't be buffered larger than intended before the module's own cap applies.
