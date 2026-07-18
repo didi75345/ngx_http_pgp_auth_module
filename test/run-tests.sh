@@ -308,6 +308,25 @@ grep -qi '^set-cookie:' "$WORK/hpc" \
     && bad "body with content before the clear-sign header rejected" \
     || ok "body with content before the clear-sign header rejected"
 
+# Compression bomb (F-003 PoC): a signed, maximally-compressed OpenPGP packet
+# that inflates ~1000x. Three layers stop it, and this exercises them:
+#   1. bodies over pgp_auth_max_body_size are refused before being read;
+#   2. this one is sized UNDER that cap, so the anchored clear-sign pre-check
+#      is what rejects it -- a binary compressed packet does not begin with
+#      "-----BEGIN PGP SIGNED MESSAGE-----", so gpg is never forked;
+#   3. gpg is invoked with --max-output regardless, capping what it can write.
+dd if=/dev/zero of="$WORK/bombsrc" bs=1M count=4 2>/dev/null
+gpg --batch --yes --compress-algo zlib --compress-level 9 \
+    --sign --output "$WORK/bomb.gpg" "$WORK/bombsrc" 2>/dev/null
+BOMBIN=$(wc -c < "$WORK/bomb.gpg"); BOMBOUT=$(wc -c < "$WORK/bombsrc")
+curl -s -X POST "$base/?__pgp_auth=1" --data-urlencode "signed@$WORK/bomb.gpg" \
+     -D "$WORK/hbomb" -o /dev/null >/dev/null
+if grep -qi '^set-cookie:' "$WORK/hbomb"; then
+    bad "compression bomb rejected (${BOMBIN}B -> ${BOMBOUT}B)"
+else
+    ok "compression bomb rejected (${BOMBIN}B inflates to ${BOMBOUT}B)"
+fi
+
 export GNUPGHOME="$WORK/gpg2"
 printf '%s' "$CH" | gpg --clearsign --batch > "$WORK/evil.asc" 2>/dev/null
 export GNUPGHOME="$WORK/gpg"
