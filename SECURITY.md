@@ -210,11 +210,29 @@ the protected location.
 
 Two things matter when configuring it:
 
-1. **Key the limit globally, not only per-IP.** A per-IP `limit_req` gives every
-   source address its own allowance, so a distributed attempt can still pile up
-   concurrent verifications. Use a constant key (one bucket for the whole login
-   endpoint) to bound total concurrency; a per-IP zone alongside it is still
-   useful for fairness.
+1. **The global limit is the protection. A per-IP limit is not.** Use a constant
+   key — one bucket for the entire login endpoint — because that is the only
+   thing that actually bounds how many verifications can be in flight, and
+   therefore the only thing that protects anything else this nginx serves.
+
+   A per-IP limit (`$binary_remote_addr`) should be treated as fairness, not
+   defence. It gives every source address its own allowance, and an attacker's
+   supply of addresses is cheap: a few dollars of cloud capacity is thousands of
+   IPs. It is also ineffective or actively misleading in exactly the deployments
+   this module suits:
+
+   - **Tor onion services** — every request reaches nginx from the local Tor
+     daemon, so *all* users share one apparent address. A per-IP limit then
+     throttles your legitimate users collectively while isolating no attacker at
+     all.
+   - **Behind a CDN or reverse proxy** — `$binary_remote_addr` is the proxy's
+     address unless `ngx_http_realip_module` is configured, so again everyone
+     lands in one bucket.
+   - **Distributed sources** — a per-IP limit simply doesn't bound the total.
+
+   Keep a per-IP zone if you want to stop one noisy client from consuming the
+   global allowance, but size the deployment on the global limit alone and treat
+   anything the per-IP zone catches as a bonus.
 2. **Prefer a paced `burst` over `nodelay`** on the global zone, so excess
    logins are spread out rather than released at once into concurrent
    verifications. Note the trade-off: without `nodelay` an over-limit client
