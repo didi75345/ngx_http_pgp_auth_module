@@ -201,17 +201,29 @@ Keep that below `worker_processes` and there is always a free worker for
 everything else nginx serves. With a global limit of 1 r/s, real occupancy is
 around 2.5% of a single worker.
 
-### Without a global `limit_req` this is an attack surface
+### Rate limiting: how much it matters depends on what else nginx serves
 
-**A globally-keyed rate limit on the login endpoint is required, not advisory.**
-With no limit, an unauthenticated client can keep workers forking `gpg` — and on
-an nginx that also serves a public site, that contention affects the public site
-too, not just the protected location.
+Without a limit, an unauthenticated client can keep workers forking `gpg`. How
+serious that is depends entirely on your deployment:
 
-To be unambiguous about what "required" covers: **exactly one limit is required,
-the global one.** A per-IP limit is optional, is not a substitute, and a
-deployment should never be sized on it. `examples/nginx.conf` therefore ships
-the global zone enabled and the per-IP zone commented out.
+- **This nginx also serves something else** — a public site, another vhost, an
+  API. Here a globally-keyed `limit_req` on the login endpoint is **required.**
+  Workers are a shared pool, so verification contention on the protected
+  location degrades everything else the instance serves. This is the case that
+  actually matters, and the reason the limit exists.
+
+- **This nginx serves only the protected location** (a dedicated admin host, an
+  onion service for one interface, and so on). Here it is **recommended, not
+  required.** The worst case is that the admin interface itself becomes slow or
+  unavailable while a flood is running — a self-contained availability problem
+  that any unauthenticated endpoint shares, not collateral damage to something
+  you were trying to protect. A limit is still worth setting so an attacker
+  can't cheaply lock you out of your own admin, but nothing else is at stake.
+
+Where a limit is used, **key it globally** — one bucket for the whole login
+endpoint. A per-IP limit is optional, is not a substitute, and a deployment
+should never be sized on it. `examples/nginx.conf` ships the global zone enabled
+and the per-IP zone commented out.
 
 Two things matter when configuring it:
 

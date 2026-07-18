@@ -67,15 +67,20 @@ So out of the box it is stateless apart from a local single-use cache; pick
 All directives are valid at `http`, `server`, and `location` scope.
 
 The login endpoint is unauthenticated and a submission forks a gpg verification,
-which occupies a worker for ~17–25 ms. **One thing is required: a `limit_req`
-keyed globally** — a single bucket for the whole login endpoint. That is what
-bounds how many verifications run at once, and so what keeps the rest of the
-site responsive.
+which occupies a worker for ~17–25 ms. Whether you need to rate-limit it depends
+on what else the instance serves:
 
-A **per-IP limit is not required and is not a substitute** — source addresses
+- **If this nginx also serves anything else** (a public site, another vhost),
+  a `limit_req` keyed **globally** — one bucket for the whole login endpoint —
+  is **required**: workers are a shared pool, so contention on the login
+  endpoint degrades everything else too.
+- **If this nginx serves only the protected location**, it's **recommended**
+  rather than required — the worst case is the admin itself being unavailable
+  during a flood, with nothing else at stake.
+
+A **per-IP limit is never required and is not a substitute** — source addresses
 are cheap at cloud scale, and behind a Tor onion service or an unconfigured
-proxy every client presents the same apparent address anyway. Add one only if
-you also want to stop a single noisy client eating the global allowance.
+proxy every client presents the same apparent address anyway.
 `examples/nginx.conf` shows the full pattern; [SECURITY.md](SECURITY.md) has the
 measured per-request costs and the sizing arithmetic. Also set
 `client_max_body_size` on the protected location to match the module's
