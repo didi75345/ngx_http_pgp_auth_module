@@ -52,7 +52,7 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_session_cookie_secure` | `on` | Add `; Secure` to the session cookie. Set `off` for a plain-HTTP deployment (e.g. one already behind an encrypted transport). |
 | `pgp_session_cookie_host_prefix` | `on` | Use the `__Host-` cookie name prefix. The prefix requires Secure, so it is applied only when `pgp_session_cookie_secure` is on; with Secure off it is dropped (nginx warns) so the cookie stays usable. |
 | `pgp_session_cookie_samesite` | `Lax` | `SameSite` attribute on the session cookie: `Lax`, `Strict`, or `None`. `None` requires `pgp_session_cookie_secure` on. |
-| `pgp_auth_bind_client_ip` | `on` | Fold the client IP into the token, blocking cross-IP replay. Behind a proxy, configure `ngx_http_realip_module`. |
+| `pgp_auth_bind_client_ip` | `on` | Fold the client IP into the token, blocking cross-IP replay. Behind a proxy, configure `ngx_http_realip_module`. Note this adds nothing where every client shares one apparent address — a Tor onion service, or a proxy without realip — since the bound value is then the same for everyone. |
 | `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
 | `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. |
 | `pgp_auth_nonce_storage_address` | — | `ip:port` of the Redis server (required for `redis`). Must be a **numeric IP**, not a hostname: resolution is done with no DNS lookup, so a slow/unreachable resolver can't block the worker on the login path. |
@@ -68,8 +68,10 @@ All directives are valid at `http`, `server`, and `location` scope.
 
 The login endpoint is unauthenticated and a submission forks a gpg verification,
 which occupies a worker for ~17–25 ms. **Rate-limiting it with `limit_req` is
-required, not optional** — and the limit should be keyed **globally**, not only
-per-IP, or a distributed attempt still gets an allowance per source address.
+required, not optional**, and it must be keyed **globally** — one bucket for the
+whole endpoint. That global limit is the protection; a per-IP limit is fairness
+at best, since source addresses are cheap to obtain and everyone shares one
+apparent address behind a Tor onion service or an unconfigured proxy.
 `examples/nginx.conf` shows the full pattern; [SECURITY.md](SECURITY.md) has the
 measured per-request costs and the sizing arithmetic. Also set
 `client_max_body_size` on the protected location to match the module's
