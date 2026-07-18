@@ -161,6 +161,79 @@ Everything else (the keyring, the secret) is operator-controlled.
   secret is a full bypass. `$TMPDIR` is honoured for the throwaway keyring dir,
   matching the documented "system temp dir".
 
+## Login endpoint: cost, and why `limit_req` is required
+
+Signature verification runs **synchronously in the nginx worker**: the module
+forks `gpg`, waits for it, and completes the request. That is a deliberate
+design trade-off (it keeps the module dependency-free and portable across nginx
+builds, with no thread-pool requirement), and it has one consequence worth
+stating plainly: **while a verification is running, that worker is busy.**
+
+### What a request actually costs
+
+Measured against the module (single worker; treat these as orders of magnitude,
+not exact figures):
+
+| Request | Worker time | Forks gpg? |
+|---------|-------------|------------|
+| Challenge page | ~1 ms | no |
+| Body that is not a clear-signed message | ~1 ms | no — rejected by the pre-check |
+| Body over `pgp_auth_max_body_size` | ~1 ms | no — rejected before it is read |
+| Authenticated request (valid session cookie) | ~1 ms | no |
+| **Genuine login (full signature verification)** | **~17 ms** | yes |
+| **Crafted body that forces gpg to run and fail** | **~25 ms** | yes |
+
+So the blocking window is **tens of milliseconds**, not seconds.
+`pgp_gpg_timeout` (2s) is a safety ceiling for pathological input, not the
+normal cost. Traffic that isn't a plausible clear-signed message never forks
+anything, so the cheap flood is already handled.
+
+### The arithmetic
+
+One worker sustains roughly **40 forced verifications per second**. The number
+of workers tied up at any moment is bounded by:
+
+```
+workers busy  ~=  rate x pgp_gpg_timeout  +  burst
+```
+
+Keep that below `worker_processes` and there is always a free worker for
+everything else nginx serves. With a global limit of 1 r/s, real occupancy is
+around 2.5% of a single worker.
+
+### Without `limit_req` this is an attack surface
+
+**Rate-limiting the login endpoint is required, not advisory.** With no limit,
+an unauthenticated client can keep workers forking `gpg` — and on an nginx that
+also serves a public site, that contention affects the public site too, not just
+the protected location.
+
+Two things matter when configuring it:
+
+1. **Key the limit globally, not only per-IP.** A per-IP `limit_req` gives every
+   source address its own allowance, so a distributed attempt can still pile up
+   concurrent verifications. Use a constant key (one bucket for the whole login
+   endpoint) to bound total concurrency; a per-IP zone alongside it is still
+   useful for fairness.
+2. **Prefer a paced `burst` over `nodelay`** on the global zone, so excess
+   logins are spread out rather than released at once into concurrent
+   verifications. Note the trade-off: without `nodelay` an over-limit client
+   *waits* (the connection is held, but nothing is forked) instead of getting an
+   immediate `503`. Paced is gentler on legitimate users retrying a login and
+   keeps concurrency smooth; add `nodelay` if you would rather shed load fast
+   and not hold connections. Either bounds gpg work — only the failure mode
+   differs.
+
+Measured against `examples/nginx.conf`: under a burst of login submissions the
+excess is throttled as configured, while ordinary requests to the same server
+continue to be served in under a millisecond — the protected endpoint absorbs
+the limit without the rest of the site noticing.
+
+`examples/nginx.conf` shows both zones wired up, with the key restricted to
+login submissions so ordinary traffic is never rate-limited. The module runs in
+the PRECONTENT phase — *after* `limit_req` (PREACCESS) — so a rejected request
+never reaches the verification path and never forks `gpg`.
+
 ## Verification
 
 The module compiles with `-Wall -Werror` (zero warnings) on Debian Bookworm
