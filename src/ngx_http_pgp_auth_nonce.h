@@ -25,6 +25,18 @@
 #define NGX_HTTP_PGP_NONCE_REDIS   2
 
 
+typedef struct {
+    ngx_uint_t       storage;      /* none | memory | redis                  */
+    ngx_shm_zone_t  *zone;         /* shared zone for the memory backend     */
+    ngx_str_t        addr;         /* redis numeric host:port                */
+    ngx_str_t        password;     /* redis AUTH password (optional)         */
+    ngx_flag_t       tls;          /* connect to redis over TLS              */
+    ngx_flag_t       tls_verify;   /* verify the redis certificate (default) */
+    ngx_str_t        tls_ca;       /* CA bundle; empty = system trust store   */
+    ngx_str_t        tls_name;     /* expected cert name (also sent as SNI);
+                                    * empty = verify against the IP literal   */
+} ngx_http_pgp_nonce_conf_t;
+
 /*
  * Register the shared-memory zone for the "memory" backend. Called from the
  * location-merge step; returns the (shared) zone or NULL on error.
@@ -39,7 +51,6 @@ ngx_shm_zone_t *ngx_http_pgp_nonce_add_zone(ngx_conf_t *cf, size_t size);
  * For NGX_HTTP_PGP_NONCE_NONE this is a no-op returning NGX_OK.
  */
 ngx_int_t ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r,
-    ngx_uint_t storage, ngx_shm_zone_t *zone, ngx_str_t *addr,
-    ngx_str_t *password, ngx_str_t *nonce, time_t exp);
+    ngx_http_pgp_nonce_conf_t *nc, ngx_str_t *nonce, time_t exp);
 
 #endif /* NGX_HTTP_PGP_AUTH_NONCE_H */
