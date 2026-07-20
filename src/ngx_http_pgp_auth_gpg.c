@@ -151,7 +151,15 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     (void) ngx_snprintf((u_char *) msgpath, sizeof(msgpath), "%s/m%Z", home);
     (void) ngx_snprintf((u_char *) plainpath, sizeof(plainpath), "%s/p%Z", home);
 
-    fd = open(msgpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    /*
+     * O_NOFOLLOW: refuse to follow a symlink at this path. The directory is
+     * created by mkdtemp() at mode 0700 owned by the worker, so nothing else
+     * should be able to plant one -- but on a shared $TMPDIR this closes the
+     * window between creating the directory and opening the file, so a write
+     * can never be redirected outside it. O_EXCL for the same reason: create
+     * it or fail, never open something already there.
+     */
+    fd = open(msgpath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd == -1) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       "pgp_auth: open(%s) failed", msgpath);
@@ -344,7 +352,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     sigprocmask(SIG_SETMASK, &prev, NULL);
 
     /* Capture the verified plaintext before cleanup wipes the temp dir. */
-    fd = open(plainpath, O_RDONLY);
+    fd = open(plainpath, O_RDONLY | O_NOFOLLOW);   /* see msgpath open above */
     if (fd != -1) {
         off = 0;
         for ( ;; ) {

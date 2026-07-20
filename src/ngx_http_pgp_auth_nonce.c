@@ -151,6 +151,17 @@ ngx_http_pgp_nonce_memory(ngx_http_request_t *r, ngx_shm_zone_t *zone,
     if (zone == NULL) {
         return NGX_ERROR;
     }
+
+    /*
+     * n->len is a u_short. The issued nonce is 32 hex chars so this cannot
+     * trigger today, but guard it explicitly: if the nonce format ever grows
+     * past 65535 the silent truncation would corrupt comparisons rather than
+     * fail visibly.
+     */
+    if (nonce->len > 65535) {
+        return NGX_ERROR;
+    }
+
     ctx = zone->data;
     hash = ngx_crc32_short(nonce->data, nonce->len);
     now = ngx_time();
@@ -168,13 +179,23 @@ ngx_http_pgp_nonce_memory(ngx_http_request_t *r, ngx_shm_zone_t *zone,
 
     n = ngx_slab_alloc_locked(ctx->shpool, size);
     if (n == NULL) {
-        /* zone full: drop the oldest entries and retry once */
-        ngx_http_pgp_nonce_evict_expired(ctx, now + 0x7fffffff, 32);
+        /*
+         * Zone full. Try harder to reclaim entries that have GENUINELY
+         * expired -- but never evict a live one. Dropping a nonce that is
+         * still inside its challenge window would let that challenge be
+         * replayed, which is the exact thing this store exists to prevent;
+         * an eviction pass with an artificial "everything is expired" cutoff
+         * would silently turn this into a fail-OPEN store under load. If
+         * nothing has really expired, deny the login instead.
+         */
+        ngx_http_pgp_nonce_evict_expired(ctx, now, 512);
         n = ngx_slab_alloc_locked(ctx->shpool, size);
         if (n == NULL) {
             ngx_shmtx_unlock(&ctx->shpool->mutex);
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "pgp_auth: nonce zone full");
+                          "pgp_auth: nonce zone full with no expired entries to "
+                          "reclaim; denying login (raise pgp_auth_nonce_zone_size, "
+                          "or use pgp_auth_nonce_storage redis)");
             return NGX_ERROR;
         }
     }

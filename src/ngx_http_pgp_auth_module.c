@@ -456,7 +456,25 @@ ngx_http_pgp_is_revoked(ngx_http_request_t *r,
     end = line + plcf->revoc_cache.len;
 
     while (line < end) {
-        nl = ngx_strlchr(line, end, '\n');
+        u_char  *lf, *cr;
+
+        /*
+         * Terminate a line on LF *or* CR, taking whichever comes first, so
+         * LF, CRLF and lone-CR files all parse. Splitting on LF alone would
+         * make a CR-only file look like one long malformed line, and every
+         * fingerprint in it would be silently ignored -- a revoked key would
+         * then keep authenticating.  (For CRLF the CR ends the line and the
+         * following LF yields an empty one, which is skipped below.)
+         */
+        lf = ngx_strlchr(line, end, '\n');
+        cr = ngx_strlchr(line, end, '\r');
+        if (lf == NULL) {
+            nl = cr;
+        } else if (cr == NULL) {
+            nl = lf;
+        } else {
+            nl = (cr < lf) ? cr : lf;
+        }
         if (nl == NULL) {
             nl = end;
         }
@@ -1373,6 +1391,30 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             "pgp_auth: pgp_session_cookie_samesite None requires "
             "pgp_session_cookie_secure on; browsers reject a SameSite=None "
             "cookie without Secure");
+    }
+
+    /*
+     * Fail-open revocation is a deliberate weakening: if the list cannot be
+     * read, a revoked key is admitted. Say so at start-up rather than leaving
+     * it to be discovered from the docs.
+     */
+    if (conf->revoc_fail_open && conf->revocation_list.len) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "pgp_auth: pgp_revocation_fail_open is on -- if \"%V\" becomes "
+            "unreadable, revoked keys will be allowed to authenticate",
+            &conf->revocation_list);
+    }
+
+    /*
+     * The Redis command is built into a fixed buffer. Reject a password that
+     * could not fit at config time, with a clear message, rather than letting
+     * the AUTH command be truncated into a malformed request at run time.
+     */
+    if (conf->nonce_password.len > 256) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "pgp_auth: pgp_auth_nonce_storage_password is too long "
+            "(%uz bytes, maximum 256)", conf->nonce_password.len);
+        return NGX_CONF_ERROR;
     }
 
     /* an absolute keyring path is required for gpg */

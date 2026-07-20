@@ -28,9 +28,11 @@ Everything else (the keyring, the secret) is operator-controlled.
   validation does not leak via timing.
 - **Bounded parsing.** Buffers are sized before writing and use length-checked
   copies; the gpg output parser reads into a fixed buffer with explicit bounds.
-- **No shell.** gpg is launched with `execlp` and an explicit argument vector,
-  never via a shell, so keyring paths and message content can't be interpreted
-  as commands.
+- **No shell.** gpg is launched with `execve` on a config-validated absolute
+  path (`pgp_gpg_path`), an explicit argument vector, and an empty environment —
+  never via a shell, and never resolved through `$PATH`. Keyring paths and
+  message content cannot be interpreted as commands, and neither a hostile
+  `$PATH` nor an inherited `LD_PRELOAD` can influence which binary runs.
 - **Pool-allocated memory.** All per-request allocations come from nginx's
   request pool and are released when the request ends, so there is no manual
   free path to get wrong (no use-after-free / double-free by construction).
@@ -268,6 +270,53 @@ the limit without the rest of the site noticing.
 login submissions so ordinary traffic is never rate-limited. The module runs in
 the PRECONTENT phase — *after* `limit_req` (PREACCESS) — so a rejected request
 never reaches the verification path and never forks `gpg`.
+
+## Residual risks and operational guidance
+
+Things that are inherent to the design rather than defects, and what an
+operator should do about them.
+
+- **The HMAC secret lives in worker memory.** It has to: every challenge and
+  session MAC is computed from it. It is therefore readable by anything that
+  can read the worker's address space, and would appear in a core dump. Disable
+  core dumps for workers (`ulimit -c 0` / `worker_rlimit_core 0`), keep the
+  secret file `chmod 600` and owned by the worker user, and treat the ability to
+  read worker memory as equivalent to holding the secret — it allows forging
+  both sessions and challenges.
+
+- **Redis traffic is not encrypted.** The nonce client speaks plain RESP over
+  TCP: if `pgp_auth_nonce_storage_password` is set, the `AUTH` is sent in
+  cleartext, as are nonce values. Run Redis on **localhost or a trusted
+  network** — a VPN, a dedicated VLAN, or a unix-level-private link. Do not
+  point it across the public internet or a shared cloud network. If you need
+  transport encryption, terminate TLS in front of Redis (e.g. stunnel/spiped);
+  the module does not negotiate TLS itself.
+
+- **The Redis address must be a numeric `ip:port`.** Resolution is done with no
+  DNS lookup (see above), so hostnames are rejected. IPv4 is the tested form;
+  an IPv6 literal must be bracketed (`[::1]:6379`) — an unbracketed IPv6
+  address is misparsed, and fails closed at connect time rather than being
+  silently misdirected.
+
+- **The revocation list is read on the request path.** Each request to a
+  protected location `stat()`s the file to check its mtime, and re-reads and
+  linearly scans it when it has changed. That keeps revocation effective within
+  seconds without a reload, at the cost of a syscall per request and a scan
+  proportional to the list's size. Keep the list on local disk rather than a
+  network filesystem, and keep it to a sane number of entries; a very large list
+  adds latency to every authenticated request.
+
+- **The `memory` nonce backend is per-node and bounded.** It fails closed: when
+  the zone is full and nothing in it has genuinely expired, logins are denied
+  rather than a live nonce being evicted to make room — evicting one would let
+  that challenge be replayed. Size `pgp_auth_nonce_zone_size` for your expected
+  concurrent logins, or use the `redis` backend where single-use must hold
+  across nodes and under sustained load.
+
+- **`pgp_revocation_fail_open on` weakens revocation by design.** With it set, an
+  unreadable revocation list admits keys instead of denying them. The module
+  warns about this at start-up. Leave it off unless you have a specific
+  availability reason.
 
 ## Verification
 
