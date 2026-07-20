@@ -284,13 +284,18 @@ operator should do about them.
   read worker memory as equivalent to holding the secret — it allows forging
   both sessions and challenges.
 
-- **Redis traffic is not encrypted.** The nonce client speaks plain RESP over
-  TCP: if `pgp_auth_nonce_storage_password` is set, the `AUTH` is sent in
-  cleartext, as are nonce values. Run Redis on **localhost or a trusted
-  network** — a VPN, a dedicated VLAN, or a unix-level-private link. Do not
-  point it across the public internet or a shared cloud network. If you need
-  transport encryption, terminate TLS in front of Redis (e.g. stunnel/spiped);
-  the module does not negotiate TLS itself.
+- **Redis traffic is cleartext unless TLS is enabled.** By default the nonce
+  client speaks plain RESP over TCP, so the `AUTH` password and nonce values
+  cross the network in clear — fine on localhost, not across a shared network.
+  Set `pgp_auth_nonce_storage_tls on` to have the module negotiate TLS itself
+  (OpenSSL, already linked by nginx — no extra dependency). The handshake
+  completes before any data is sent, so `AUTH` is never exposed. The
+  certificate is verified by default (`pgp_auth_nonce_storage_tls_verify on`);
+  supply `pgp_auth_nonce_storage_tls_ca` for a private CA. Because the address
+  must be a numeric IP, either the certificate carries an `iPAddress` SAN or
+  you name the expected identity with `pgp_auth_nonce_storage_tls_name`, which
+  is also sent as SNI. Verification failure fails the login closed rather than
+  falling back to cleartext.
 
 - **The Redis address must be a numeric `ip:port`.** Resolution is done with no
   DNS lookup (see above), so hostnames are rejected. IPv4 is the tested form;

@@ -17,6 +17,10 @@
 #include <errno.h>
 #include <string.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+
 extern ngx_module_t  ngx_http_pgp_auth_module;
 
 #define NGX_HTTP_PGP_REDIS_TIMEOUT_MS  500
@@ -296,35 +300,187 @@ ngx_http_pgp_nonce_wait(int fd, short ev, int timeout_ms)
 
 
 /*
+ * Establish TLS on an already-connected (non-blocking) socket.
+ *
+ * `host` is the numeric IP we dialled. Because the address must be numeric
+ * (see the AI_NUMERICHOST note below), certificate identity cannot be checked
+ * against a DNS name unless the operator tells us which name to expect --
+ * that is what pgp_auth_nonce_storage_tls_name is for. With a name we send SNI
+ * and verify against it; without one we verify against the IP, which requires
+ * the certificate to carry an iPAddress SAN.
+ *
+ * Returns the SSL* (caller frees it and *ctx_out) or NULL on failure.
+ */
+static SSL *
+ngx_http_pgp_nonce_tls(ngx_http_request_t *r, int fd, const char *host,
+    ngx_flag_t verify, ngx_str_t *ca, ngx_str_t *name, SSL_CTX **ctx_out)
+{
+    int                 rc;
+    char                buf[512];
+    SSL                *ssl;
+    SSL_CTX            *ctx;
+    X509_VERIFY_PARAM  *param;
+
+    *ctx_out = NULL;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        return NULL;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    if (verify) {
+        if (ca->len) {
+            if (ca->len >= sizeof(buf)) {
+                goto failed;
+            }
+            ngx_memcpy(buf, ca->data, ca->len);
+            buf[ca->len] = '\0';
+            if (SSL_CTX_load_verify_locations(ctx, buf, NULL) != 1) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "pgp_auth: redis TLS: cannot load CA \"%V\"", ca);
+                goto failed;
+            }
+        } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            goto failed;
+        }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    ssl = SSL_new(ctx);
+    if (ssl == NULL) {
+        goto failed;
+    }
+    if (SSL_set_fd(ssl, fd) != 1) {
+        SSL_free(ssl);
+        goto failed;
+    }
+
+    if (name->len && name->len < sizeof(buf)) {
+        ngx_memcpy(buf, name->data, name->len);
+        buf[name->len] = '\0';
+        SSL_set_tlsext_host_name(ssl, buf);          /* SNI: real hostname */
+    }
+
+    if (verify) {
+        param = SSL_get0_param(ssl);
+        X509_VERIFY_PARAM_set_hostflags(param,
+            X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        if (name->len && name->len < sizeof(buf)) {
+            rc = X509_VERIFY_PARAM_set1_host(param, buf, 0);
+        } else {
+            rc = X509_VERIFY_PARAM_set1_ip_asc(param, host);
+        }
+        if (rc != 1) {
+            SSL_free(ssl);
+            goto failed;
+        }
+    }
+
+    for ( ;; ) {
+        rc = SSL_connect(ssl);
+        if (rc == 1) {
+            break;
+        }
+        rc = SSL_get_error(ssl, rc);
+        if (rc == SSL_ERROR_WANT_READ || rc == SSL_ERROR_WANT_WRITE) {
+            if (ngx_http_pgp_nonce_wait(fd,
+                    (rc == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT,
+                    NGX_HTTP_PGP_REDIS_TIMEOUT_MS) > 0)
+            {
+                continue;
+            }
+        }
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "pgp_auth: redis TLS handshake failed "
+                      "(verify=%d, cert must match %s)",
+                      (int) verify, name->len ? "the configured tls_name"
+                                              : "the IP address");
+        SSL_free(ssl);
+        goto failed;
+    }
+
+    *ctx_out = ctx;
+    return ssl;
+
+failed:
+
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+
+/*
  * Send one RESP command and read one reply into `reply` (NUL-terminated).
+ * Uses TLS when `ssl` is non-NULL, the plain socket otherwise.
  * Returns the number of bytes read (>0) or -1 on error/timeout/closed.
  */
 static ssize_t
-ngx_http_pgp_nonce_redis_roundtrip(int fd, const char *cmd, size_t cmdlen,
-    char *reply, size_t replysz)
+ngx_http_pgp_nonce_redis_roundtrip(int fd, SSL *ssl, const char *cmd,
+    size_t cmdlen, char *reply, size_t replysz)
 {
+    int      e;
     size_t   k;
     ssize_t  w;
 
     for (k = 0; k < cmdlen; ) {
-        if (ngx_http_pgp_nonce_wait(fd, POLLOUT,
-                                    NGX_HTTP_PGP_REDIS_TIMEOUT_MS) <= 0)
-        {
-            return -1;
+        if (ssl == NULL) {
+            if (ngx_http_pgp_nonce_wait(fd, POLLOUT,
+                                        NGX_HTTP_PGP_REDIS_TIMEOUT_MS) <= 0)
+            {
+                return -1;
+            }
+            w = send(fd, cmd + k, cmdlen - k, MSG_NOSIGNAL);
+
+        } else {
+            w = SSL_write(ssl, cmd + k, (int) (cmdlen - k));
+            if (w <= 0) {
+                e = SSL_get_error(ssl, (int) w);
+                if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                    && ngx_http_pgp_nonce_wait(fd,
+                           (e == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT,
+                           NGX_HTTP_PGP_REDIS_TIMEOUT_MS) > 0)
+                {
+                    continue;
+                }
+                return -1;
+            }
         }
-        w = send(fd, cmd + k, cmdlen - k, MSG_NOSIGNAL);
+
         if (w <= 0) {
             return -1;
         }
         k += (size_t) w;
     }
 
-    if (ngx_http_pgp_nonce_wait(fd, POLLIN, NGX_HTTP_PGP_REDIS_TIMEOUT_MS)
-        <= 0)
-    {
-        return -1;
+    for ( ;; ) {
+        if (ssl == NULL) {
+            if (ngx_http_pgp_nonce_wait(fd, POLLIN,
+                                        NGX_HTTP_PGP_REDIS_TIMEOUT_MS) <= 0)
+            {
+                return -1;
+            }
+            w = recv(fd, reply, replysz - 1, 0);
+
+        } else {
+            w = SSL_read(ssl, reply, (int) (replysz - 1));
+            if (w <= 0) {
+                e = SSL_get_error(ssl, (int) w);
+                if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                    && ngx_http_pgp_nonce_wait(fd,
+                           (e == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT,
+                           NGX_HTTP_PGP_REDIS_TIMEOUT_MS) > 0)
+                {
+                    continue;
+                }
+                return -1;
+            }
+        }
+        break;
     }
-    w = recv(fd, reply, replysz - 1, 0);
+
     if (w <= 0) {
         return -1;
     }
@@ -334,8 +490,8 @@ ngx_http_pgp_nonce_redis_roundtrip(int fd, const char *cmd, size_t cmdlen,
 
 
 static ngx_int_t
-ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
-    ngx_str_t *password, ngx_str_t *nonce, time_t exp)
+ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
+    ngx_str_t *nonce, time_t exp)
 {
     int               fd = -1, err;
     long              ttl;
@@ -344,6 +500,11 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
     ssize_t           k;
     size_t            off;
     char              host[256], *colon, buf[512], reply[128], ttlbuf[24];
+    ngx_int_t         rc = NGX_ERROR;
+    SSL              *ssl = NULL;
+    SSL_CTX          *ssl_ctx = NULL;
+    ngx_str_t        *addr = &nc->addr;
+    ngx_str_t        *password = &nc->password;
     struct addrinfo   hints, *ai = NULL, *rp;
 
     ttl = (long) (exp - ngx_time());
@@ -415,6 +576,19 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
     }
 
     /*
+     * Wrap the connection in TLS before anything is sent -- the AUTH password
+     * and the nonce must never cross the network in clear when TLS is enabled.
+     */
+    if (nc->tls) {
+        ssl = ngx_http_pgp_nonce_tls(r, fd, host, nc->tls_verify, &nc->tls_ca,
+                                     &nc->tls_name, &ssl_ctx);
+        if (ssl == NULL) {
+            close(fd);
+            return NGX_ERROR;
+        }
+    }
+
+    /*
      * Authenticate first if a password is configured. A misconfigured or
      * rejected AUTH must not fall through to an unauthenticated SET -- fail
      * closed on anything other than a clean "+OK".
@@ -424,13 +598,12 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
             "*2\r\n$4\r\nAUTH\r\n$%uz\r\n%V\r\n",
             password->len, password) - (u_char *) buf);
 
-        k = ngx_http_pgp_nonce_redis_roundtrip(fd, buf, off, reply,
+        k = ngx_http_pgp_nonce_redis_roundtrip(fd, ssl, buf, off, reply,
                                                sizeof(reply));
         if (k <= 0 || reply[0] != '+') {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                           "pgp_auth: redis AUTH failed");
-            close(fd);
-            return NGX_ERROR;
+            goto done;
         }
     }
 
@@ -441,10 +614,10 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
         (size_t) (nonce->len + 4), nonce,
         ttl_len, ttl_len, ttlbuf) - (u_char *) buf);
 
-    k = ngx_http_pgp_nonce_redis_roundtrip(fd, buf, off, reply, sizeof(reply));
-    close(fd);
+    k = ngx_http_pgp_nonce_redis_roundtrip(fd, ssl, buf, off, reply,
+                                           sizeof(reply));
     if (k <= 0) {
-        return NGX_ERROR;
+        goto done;
     }
 
     /*
@@ -460,32 +633,41 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_str_t *addr,
      *                      during a Redis outage.
      */
     if (reply[0] == '+') {
-        return NGX_OK;
-    }
-    if (reply[0] == '$' || reply[0] == '_') {
-        return NGX_DECLINED;
-    }
-    if (reply[0] == '-') {
+        rc = NGX_OK;
+
+    } else if (reply[0] == '$' || reply[0] == '_') {
+        rc = NGX_DECLINED;
+
+    } else if (reply[0] == '-') {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "pgp_auth: redis error reply: %s", reply);
-        return NGX_ERROR;
     }
-    return NGX_ERROR;
+
+done:
+
+    if (ssl != NULL) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    if (ssl_ctx != NULL) {
+        SSL_CTX_free(ssl_ctx);
+    }
+    close(fd);
+    return rc;
 }
 
 
 ngx_int_t
-ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r, ngx_uint_t storage,
-    ngx_shm_zone_t *zone, ngx_str_t *addr, ngx_str_t *password,
-    ngx_str_t *nonce, time_t exp)
+ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r,
+    ngx_http_pgp_nonce_conf_t *nc, ngx_str_t *nonce, time_t exp)
 {
-    switch (storage) {
+    switch (nc->storage) {
 
     case NGX_HTTP_PGP_NONCE_MEMORY:
-        return ngx_http_pgp_nonce_memory(r, zone, nonce, exp);
+        return ngx_http_pgp_nonce_memory(r, nc->zone, nonce, exp);
 
     case NGX_HTTP_PGP_NONCE_REDIS:
-        return ngx_http_pgp_nonce_redis(r, addr, password, nonce, exp);
+        return ngx_http_pgp_nonce_redis(r, nc, nonce, exp);
 
     default:                                           /* NONE */
         return NGX_OK;

@@ -57,6 +57,10 @@ typedef struct {
     size_t       nonce_zone_size;     /* size of that shared zone           */
     ngx_str_t    nonce_addr;          /* redis host:port                    */
     ngx_str_t    nonce_password;      /* redis AUTH password (optional)     */
+    ngx_flag_t   nonce_tls;           /* reach redis over TLS               */
+    ngx_flag_t   nonce_tls_verify;    /* verify the redis certificate       */
+    ngx_str_t    nonce_tls_ca;        /* CA bundle (empty = system store)   */
+    ngx_str_t    nonce_tls_name;      /* expected cert name / SNI           */
     ngx_str_t    revocation_list;     /* path: revoked key fingerprints     */
     ngx_flag_t   revoc_fail_open;     /* on error, allow (1) or deny (0)    */
     time_t       revoc_mtime;         /* cached file mtime (per worker)     */
@@ -212,6 +216,34 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_password),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_tls"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_tls),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_tls_verify"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_tls_verify),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_tls_ca"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_tls_ca),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_tls_name"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_tls_name),
       NULL },
 
     { ngx_string("pgp_revocation_list"),
@@ -753,9 +785,18 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
         nonce.data = s2 + 1;
         nonce.len = s3 - (s2 + 1);
 
-        rc = ngx_http_pgp_nonce_check_and_set(r, plcf->nonce_storage,
-                 plcf->nonce_zone, &plcf->nonce_addr, &plcf->nonce_password,
-                 &nonce, exp);
+        ngx_http_pgp_nonce_conf_t  nc;
+
+        nc.storage    = plcf->nonce_storage;
+        nc.zone       = plcf->nonce_zone;
+        nc.addr       = plcf->nonce_addr;
+        nc.password   = plcf->nonce_password;
+        nc.tls        = plcf->nonce_tls;
+        nc.tls_verify = plcf->nonce_tls_verify;
+        nc.tls_ca     = plcf->nonce_tls_ca;
+        nc.tls_name   = plcf->nonce_tls_name;
+
+        rc = ngx_http_pgp_nonce_check_and_set(r, &nc, &nonce, exp);
         if (rc == NGX_DECLINED) {
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                           "pgp_auth: challenge already used (replay)");
@@ -1233,6 +1274,8 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
+    conf->nonce_tls = NGX_CONF_UNSET;
+    conf->nonce_tls_verify = NGX_CONF_UNSET;
     conf->nonce_zone_size = NGX_CONF_UNSET_SIZE;
     conf->revoc_fail_open = NGX_CONF_UNSET;
     conf->gpg_timeout = NGX_CONF_UNSET_MSEC;
@@ -1346,6 +1389,10 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->nonce_zone_size, prev->nonce_zone_size,
                               NGX_HTTP_PGP_NONCE_ZONE_SIZE);
     ngx_conf_merge_str_value(conf->nonce_addr, prev->nonce_addr, "");
+    ngx_conf_merge_value(conf->nonce_tls, prev->nonce_tls, 0);
+    ngx_conf_merge_value(conf->nonce_tls_verify, prev->nonce_tls_verify, 1);
+    ngx_conf_merge_str_value(conf->nonce_tls_ca, prev->nonce_tls_ca, "");
+    ngx_conf_merge_str_value(conf->nonce_tls_name, prev->nonce_tls_name, "");
     ngx_conf_merge_str_value(conf->nonce_password, prev->nonce_password, "");
     ngx_conf_merge_str_value(conf->revocation_list, prev->revocation_list, "");
     /* revocation fails CLOSED by default: an unreadable list denies access */
