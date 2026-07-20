@@ -82,6 +82,11 @@ echo "$SUBPRIMARY" > "$WORK/revoked-primary.txt"            # revoke by PRIMARY 
 # might paste it straight from `gpg --fingerprint` -- must still revoke.
 sed 's/..../& /g' "$WORK/revoked.txt" | tr 'A-F' 'a-f' > "$WORK/revoked-spaced.txt"
 
+# the same list written with CR-only line endings (classic Mac / some editors
+# and file transfers). Splitting on LF alone would see one malformed line and
+# silently ignore every fingerprint in it.
+tr '\n' '\r' < "$WORK/revoked.txt" > "$WORK/revoked-cr.txt"
+
 # htpasswd for the auth_basic ordering test (user pgptest / pass pw)
 printf '%s\n' 'pgptest:$apr1$abcd1234$UEURWw71lGBk.LwDG1Xr4/' > "$WORK/htpasswd"
 
@@ -135,6 +140,14 @@ http {
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_revocation_list $WORK/revoked-primary.txt;
+            root $WORK/html;
+        }
+        location /revoc-cr/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-cr.txt;
+            pgp_auth_nonce_storage none;
             root $WORK/html;
         }
         location /revoc-spaced/ {
@@ -435,6 +448,18 @@ curl -s -X POST "$base/revoc-spaced/?__pgp_auth=1" --data-urlencode "signed@$WOR
 grep -qi '^set-cookie:' "$WORK/hsp" \
     && bad "spaced/lowercase fingerprint NOT revoked (normalization gap)" \
     || ok "spaced/lowercase revocation entry still revokes"
+
+# A revocation list written with CR-only line endings must still revoke: a
+# parser that splits on LF alone would treat the file as one malformed line
+# and silently let every listed key back in.
+curl -s "$base/revoc-cr/" -o "$WORK/crp" >/dev/null
+CRCH="$(challenge "$WORK/crp")"
+printf '%s' "$CRCH" | gpg --clearsign --batch > "$WORK/crs.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-cr/?__pgp_auth=1" --data-urlencode "signed@$WORK/crs.asc" \
+     -D "$WORK/hcr" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hcr" \
+    && bad "CR-only revocation list NOT honoured (revoked key admitted)" \
+    || ok "CR-only line endings in the revocation list still revoke"
 
 # Oversized auth body is rejected (413) before gpg is forked.
 head -c 40000 /dev/urandom | base64 > "$WORK/big"
