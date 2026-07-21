@@ -177,12 +177,12 @@ verification is **synchronous** in the worker instead: the module forks `gpg`,
 waits, and completes the request, so while a verification runs that worker is
 busy. The two modes are otherwise identical; only *where* gpg runs differs.
 
-Measured on one worker: with the pool on, a burst of concurrent logins runs in
-parallel (bounded by the pool's thread count) and an ordinary request to the
-same worker during the burst still completes in **~1 ms**; with the pool off,
-that same ordinary request waits behind the gpg queue. Either way the sizing
-below applies — the pool changes how much concurrency one worker absorbs before
-`limit_req` is what bounds it.
+Measured on one worker (`worker_processes 1`) on Debian's threaded nginx, with a
+deliberately slowed gpg so the effect is visible: with the pool on (default),
+while a **2-second** verification is in flight an ordinary request to that same
+worker still completes in **~0.8 ms** — the worker is not blocked. With
+`pgp_gpg_thread_pool off`, that same ordinary request waits behind the
+verification. The two modes are sized differently — see the arithmetic below.
 
 ### What a request actually costs
 
@@ -205,35 +205,57 @@ anything, so the cheap flood is already handled.
 
 ### The arithmetic
 
-One worker sustains roughly **40 forced verifications per second**. The number
-of workers tied up at any moment is bounded by:
+What bounds concurrency, and whether it can starve anything else nginx serves,
+depends on which mode gpg runs in.
+
+**With the thread pool (the default).** The worker never blocks: it posts the
+gpg verification to the pool and returns to its event loop. So verifications do
+**not** tie up workers — the ceiling is the pool's thread count:
+
+```
+concurrent verifications  ~=  thread_pool "threads=" (default 32)
+```
+
+Excess logins queue for a pool thread rather than occupying a worker, and the
+worker keeps serving everything else — a co-hosted public site is unaffected by
+a login flood because no worker is ever blocked on gpg. The thing to size is the
+pool (`thread_pool name threads=N`) and the number of concurrent `gpg`
+*processes* it implies (one per busy thread).
+
+**Synchronous mode (`pgp_gpg_thread_pool off`, or an nginx built without
+`--with-threads`).** Here a verification does occupy the worker for its
+duration, so the number of workers tied up at any moment is bounded by:
 
 ```
 workers busy  ~=  rate x pgp_gpg_timeout  +  burst
 ```
 
 Keep that below `worker_processes` and there is always a free worker for
-everything else nginx serves. With a global limit of 1 r/s, real occupancy is
-around 2.5% of a single worker.
+everything else. One worker sustains roughly **40 forced verifications per
+second**; with a global `limit_req` of 1 r/s, occupancy is around 2.5% of a
+single worker.
 
-### Rate limiting: how much it matters depends on what else nginx serves
+### Rate limiting: still worth it, for different reasons in each mode
 
-Without a limit, an unauthenticated client can keep workers forking `gpg`. How
-serious that is depends entirely on your deployment:
+The wording "keep workers forking gpg" only describes the **synchronous** mode.
+With the thread pool the worker is never blocked, so the emphasis shifts from
+"protect other sites from worker starvation" to "bound resource use." A
+globally-keyed `limit_req` is worth having in both modes:
 
-- **This nginx also serves something else** — a public site, another vhost, an
-  API. Here a globally-keyed `limit_req` on the login endpoint is **required.**
-  Workers are a shared pool, so verification contention on the protected
-  location degrades everything else the instance serves. This is the case that
-  actually matters, and the reason the limit exists.
+- **Thread-pool mode (default): recommended.** A flood cannot starve co-hosted
+  sites — the worker stays on its event loop — but without a limit an attacker
+  can still keep all pool threads busy (so *logins* stall), spawn up to that many
+  concurrent `gpg` processes, grow the pool's task queue, and hold connections
+  and per-request memory. `limit_req` caps all of that. It is no longer the only
+  thing standing between an attacker and worker exhaustion — the pool is — but it
+  keeps the login endpoint and the box's resource use bounded.
 
-- **This nginx serves only the protected location** (a dedicated admin host, an
-  onion service for one interface, and so on). Here it is **recommended, not
-  required.** The worst case is that the admin interface itself becomes slow or
-  unavailable while a flood is running — a self-contained availability problem
-  that any unauthenticated endpoint shares, not collateral damage to something
-  you were trying to protect. A limit is still worth setting so an attacker
-  can't cheaply lock you out of your own admin, but nothing else is at stake.
+- **Synchronous mode: required if this nginx serves anything else.** With no
+  thread pool a verification blocks a worker, and workers are a shared pool, so
+  login contention degrades every other site the instance serves. A
+  globally-keyed `limit_req` is then not optional. If the instance serves only
+  the protected location, it is recommended rather than required — the worst case
+  is the admin itself being slow during a flood, with nothing else at stake.
 
 Where a limit is used, **key it globally** — one bucket for the whole login
 endpoint. A per-IP limit is optional, is not a substitute, and a deployment
