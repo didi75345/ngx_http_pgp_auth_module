@@ -18,7 +18,8 @@ tar xzf nginx.tgz
 cd "nginx-${NGINX_VERSION}"
 # configure only to generate objs/ngx_auto_config.h etc. (headers for the addon)
 ./configure --with-compat --add-dynamic-module="$HERE" \
-    --without-http_rewrite_module --without-http_gzip_module >/dev/null
+    --without-http_rewrite_module --without-http_gzip_module \
+    --with-http_ssl_module --with-threads >/dev/null
 
 INCS="-I src/core -I src/event -I src/event/modules -I src/os/unix -I objs
       -I src/http -I src/http/modules"

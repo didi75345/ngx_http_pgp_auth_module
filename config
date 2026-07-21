@@ -9,11 +9,14 @@ if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_pgp_auth_module
     ngx_module_srcs="$PGP_AUTH_SRCS"
-    ngx_module_libs="-lcrypto"
+    # -lcrypto for the HMAC tokens; -lssl for the optional Redis TLS transport.
+    # Linked by the module itself so it does not depend on nginx being built
+    # --with-http_ssl_module.
+    ngx_module_libs="-lssl -lcrypto"
     . auto/module
 else
     # legacy static build
     HTTP_MODULES="$HTTP_MODULES ngx_http_pgp_auth_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $PGP_AUTH_SRCS"
-    CORE_LIBS="$CORE_LIBS -lcrypto"
+    CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 fi

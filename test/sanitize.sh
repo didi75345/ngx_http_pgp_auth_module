@@ -31,6 +31,7 @@ cd "nginx-${NGINX_VERSION}"
 # is unrelated to the module under test.
 ./configure --with-compat --add-dynamic-module="$HERE" \
     --without-http_rewrite_module --without-http_gzip_module \
+    --with-http_ssl_module --with-threads \
     --with-cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
     --with-ld-opt="-fsanitize=address,undefined" >/dev/null
 make -j"$(nproc)" >/dev/null

@@ -163,13 +163,26 @@ Everything else (the keyring, the secret) is operator-controlled.
   secret is a full bypass. `$TMPDIR` is honoured for the throwaway keyring dir,
   matching the documented "system temp dir".
 
-## Login endpoint: cost, and why `limit_req` is required
+## Login endpoint: cost, thread pool, and `limit_req`
 
-Signature verification runs **synchronously in the nginx worker**: the module
-forks `gpg`, waits for it, and completes the request. That is a deliberate
-design trade-off (it keeps the module dependency-free and portable across nginx
-builds, with no thread-pool requirement), and it has one consequence worth
-stating plainly: **while a verification is running, that worker is busy.**
+Verifying a signature means forking `gpg` and waiting for it. By default that
+work runs on an nginx **thread pool** (`pgp_gpg_thread_pool`, default `default`,
+auto-created), so the worker hands the blocking gpg call to a pool thread and
+returns to its event loop immediately — it keeps serving other requests while
+verification runs. This uses only nginx's own thread-pool API (present in any
+build compiled `--with-threads`, no external dependency).
+
+On an nginx built **without** thread support, or with `pgp_gpg_thread_pool off`,
+verification is **synchronous** in the worker instead: the module forks `gpg`,
+waits, and completes the request, so while a verification runs that worker is
+busy. The two modes are otherwise identical; only *where* gpg runs differs.
+
+Measured on one worker: with the pool on, a burst of concurrent logins runs in
+parallel (bounded by the pool's thread count) and an ordinary request to the
+same worker during the burst still completes in **~1 ms**; with the pool off,
+that same ordinary request waits behind the gpg queue. Either way the sizing
+below applies — the pool changes how much concurrency one worker absorbs before
+`limit_req` is what bounds it.
 
 ### What a request actually costs
 
