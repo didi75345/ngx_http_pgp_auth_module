@@ -33,6 +33,10 @@
 #include "ngx_http_pgp_auth_gpg.h"
 #include "ngx_http_pgp_auth_nonce.h"
 
+#if (NGX_THREADS)
+#include <ngx_thread_pool.h>
+#endif
+
 
 #define NGX_HTTP_PGP_COOKIE       "pgp_session"
 #define NGX_HTTP_PGP_COOKIE_HOST  "__Host-pgp_session"
@@ -70,7 +74,30 @@ typedef struct {
     ngx_str_t    gpg_path;            /* absolute path to the gpg binary    */
     ngx_str_t    secret_file;
     ngx_str_t    secret;              /* loaded HMAC secret bytes           */
+    ngx_str_t    thread_pool_name;    /* gpg thread pool ("off" = sync)     */
+#if (NGX_THREADS)
+    ngx_thread_pool_t *thread_pool;   /* resolved pool, or NULL for sync    */
+#endif
 } ngx_http_pgp_auth_loc_conf_t;
+
+
+#if (NGX_THREADS)
+/*
+ * Carried across the thread boundary for one async verification. Allocated in
+ * the request pool; the request is pinned (r->main->blocked++, r->aio = 1)
+ * from post until the completion handler runs, so this and everything it
+ * points at stays alive while the pool thread uses it.
+ */
+typedef struct {
+    ngx_http_request_t            *r;
+    ngx_http_pgp_auth_loc_conf_t  *plcf;
+    ngx_log_t                     *log;
+    u_char                        *msg;
+    size_t                         len;
+    ngx_int_t                      gpg_rc;   /* return of gpg_verify         */
+    ngx_http_pgp_verify_result_t  *vr;       /* filled by the thread         */
+} ngx_http_pgp_thread_ctx_t;
+#endif
 
 
 static ngx_conf_enum_t  ngx_http_pgp_nonce_storage_enum[] = {
@@ -105,8 +132,12 @@ static ngx_int_t ngx_http_pgp_ct_eq(ngx_str_t *a, ngx_str_t *b);
 
 static ngx_int_t ngx_http_pgp_check_session(ngx_http_request_t *r,
     ngx_http_pgp_auth_loc_conf_t *plcf);
-static ngx_int_t ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
-    ngx_http_pgp_auth_loc_conf_t *plcf, u_char *msg, size_t len);
+static ngx_int_t ngx_http_pgp_verify_pre(ngx_http_request_t *r,
+    u_char *msg, size_t len);
+static ngx_int_t ngx_http_pgp_verify_post(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_http_pgp_verify_result_t *vr);
+static void ngx_http_pgp_verify_finalize(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_int_t rc);
 static ngx_int_t ngx_http_pgp_send_challenge(ngx_http_request_t *r,
     ngx_http_pgp_auth_loc_conf_t *plcf, ngx_uint_t failed);
 static ngx_int_t ngx_http_pgp_grant(ngx_http_request_t *r,
@@ -279,6 +310,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, gpg_path),
+      NULL },
+
+    { ngx_string("pgp_gpg_thread_pool"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, thread_pool_name),
       NULL },
 
       ngx_null_command
@@ -653,67 +691,65 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
  * we issued (valid HMAC, unexpired) and carry a good PGP signature from a key
  * in the keyring. On success, fpr receives the signing key fingerprint.
  */
+/*
+ * Cheap pre-filter, run in the worker before any (blocking) gpg process is
+ * spawned -- important given this endpoint is unauthenticated. Only fork gpg
+ * for something that at least looks like a clear-signed block. Require the
+ * header at the very START of the body (after optional leading whitespace),
+ * not merely somewhere inside it: a genuine clearsigned message begins with
+ * this line, and requiring it up front stops an attacker from prepending a
+ * compressed OpenPGP packet ahead of it, which gpg --decrypt would otherwise
+ * inflate. Together with gpg's --max-output cap this bounds the amplification
+ * surface. Returns NGX_OK to proceed to verification, NGX_DECLINED to reject.
+ */
 static ngx_int_t
-ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
-    ngx_http_pgp_auth_loc_conf_t *plcf, u_char *msg, size_t len)
+ngx_http_pgp_verify_pre(ngx_http_request_t *r, u_char *msg, size_t len)
 {
-    time_t                          exp;
-    u_char                         *p, *last, *line_end, *s1, *s2, *s3;
-    ngx_str_t                       payload, mac_have, mac_want, fpr;
-    ngx_http_pgp_verify_result_t    vr;
+    static const u_char  hdr[] = "-----BEGIN PGP SIGNED MESSAGE-----";
+    u_char              *q = msg;
+    u_char              *mend = msg + len;
 
-    /*
-     * Verify the PGP signature FIRST, and from here on look at only the bytes
-     * gpg actually verified (vr.plaintext) -- never the raw submitted body.
-     * Otherwise an attacker could take any message signed by a keyring key and
-     * append/prepend a genuine challenge outside the signed region.
-     */
-    /*
-     * Cheap pre-filter: only fork gpg for something that at least looks like a
-     * clear-signed block. Garbage submissions are rejected here, before the
-     * (blocking) gpg process is ever spawned -- important given this endpoint
-     * is unauthenticated. Pair with limit_req (see examples/nginx.conf).
-     *
-     * Require the header at the very START of the body (after optional leading
-     * whitespace), not merely somewhere inside it. A genuine clearsigned
-     * message begins with this line; requiring it up front stops an attacker
-     * from prepending a compressed OpenPGP packet ahead of it, which gpg
-     * --decrypt would otherwise inflate. Together with gpg's --max-output cap
-     * this bounds the data-amplification surface.
-     */
+    while (q < mend
+           && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n'))
     {
-        static const u_char  hdr[] = "-----BEGIN PGP SIGNED MESSAGE-----";
-        u_char              *q = msg;
-        u_char              *mend = msg + len;
-
-        while (q < mend
-               && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n'))
-        {
-            q++;
-        }
-        if ((size_t) (mend - q) < sizeof(hdr) - 1
-            || ngx_strncmp(q, hdr, sizeof(hdr) - 1) != 0)
-        {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "pgp_auth: submission is not a clear-signed message");
-            return NGX_DECLINED;
-        }
+        q++;
+    }
+    if ((size_t) (mend - q) < sizeof(hdr) - 1
+        || ngx_strncmp(q, hdr, sizeof(hdr) - 1) != 0)
+    {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: submission is not a clear-signed message");
+        return NGX_DECLINED;
     }
 
-    if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->gpg_path,
-                                &plcf->keyring, msg, len,
-                                plcf->gpg_timeout, &vr) != NGX_OK)
-    {
-        return NGX_ERROR;
-    }
-    if (!vr.valid) {
+    return NGX_OK;
+}
+
+
+/*
+ * Everything after the gpg subprocess: validate the signature result, check
+ * revocation, find and verify our challenge inside the SIGNED plaintext (never
+ * the raw body -- so text appended/prepended outside the signature can't be
+ * treated as signed), enforce single-use, and grant a session. Split from the
+ * pre-check and the gpg call so it can run either inline (sync) or from the
+ * thread-pool completion handler (async) -- see ngx_http_pgp_auth_submit.
+ */
+static ngx_int_t
+ngx_http_pgp_verify_post(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_http_pgp_verify_result_t *vr)
+{
+    time_t       exp;
+    u_char      *p, *last, *line_end, *s1, *s2, *s3;
+    ngx_str_t    payload, mac_have, mac_want, fpr;
+
+    if (!vr->valid) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: signature not from a keyring key");
         return NGX_DECLINED;
     }
 
-    fpr.data = vr.fpr;
-    fpr.len = vr.fpr_len;
+    fpr.data = vr->fpr;
+    fpr.len = vr->fpr_len;
     if (ngx_http_pgp_is_revoked(r, plcf, &fpr)) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: signing key is revoked");
@@ -721,8 +757,8 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
     }
 
     /* locate our challenge line ("v1|...") inside the SIGNED plaintext */
-    last = vr.plaintext + vr.plaintext_len;
-    for (p = vr.plaintext; p + 3 <= last; p++) {
+    last = vr->plaintext + vr->plaintext_len;
+    for (p = vr->plaintext; p + 3 <= last; p++) {
         if (p[0] == 'v' && p[1] == '1' && p[2] == '|') {
             break;
         }
@@ -809,9 +845,43 @@ ngx_http_pgp_verify_challenge(ngx_http_request_t *r,
         }
     }
 
-    fpr.data = vr.fpr;
-    fpr.len = vr.fpr_len;
+    fpr.data = vr->fpr;
+    fpr.len = vr->fpr_len;
     return ngx_http_pgp_grant(r, plcf, &fpr);
+}
+
+
+/*
+ * Turn a verify result code (NGX_HTTP_SEE_OTHER on success, NGX_ERROR on an
+ * internal failure, anything else = verification failed) into the response.
+ * Shared by the sync submit path and the async thread-completion handler.
+ */
+static void
+ngx_http_pgp_verify_finalize(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_int_t rc)
+{
+    if (rc == NGX_HTTP_SEE_OTHER) {
+        /*
+         * Send the 303 ourselves (status + Set-Cookie + relative Location, no
+         * body). Going through nginx's special-response path instead would
+         * rewrite the Location to an absolute URL with nginx's own port.
+         */
+        rc = ngx_http_send_header(r);
+        if (rc == NGX_ERROR || rc > NGX_OK) {
+            ngx_http_finalize_request(r, rc);
+            return;
+        }
+        ngx_http_finalize_request(r, ngx_http_send_special(r, NGX_HTTP_LAST));
+        return;
+    }
+
+    if (rc == NGX_ERROR) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    /* verification failed: re-serve the challenge with an error notice */
+    ngx_http_finalize_request(r, ngx_http_pgp_send_challenge(r, plcf, 1));
 }
 
 
@@ -1138,13 +1208,95 @@ ngx_http_pgp_form_field(ngx_str_t *body, ngx_str_t *out)
 }
 
 
+#if (NGX_THREADS)
+
+/*
+ * Runs on a THREAD-POOL thread, off the worker's event loop. Does only the
+ * blocking gpg verification -- it must not touch `r` or call any ngx_http_*
+ * function (those are not thread-safe). It reads stable inputs (the conf
+ * strings, the body buffer) and writes its result into tctx, which the worker
+ * reads once the completion event fires. The request is pinned across this
+ * window (see ngx_http_pgp_auth_submit), so nothing here is freed underneath.
+ */
+static void
+ngx_http_pgp_gpg_thread(void *data, ngx_log_t *log)
+{
+    ngx_http_pgp_thread_ctx_t  *tctx = data;
+
+    tctx->gpg_rc = ngx_http_pgp_gpg_verify(tctx->log, &tctx->plcf->gpg_path,
+                       &tctx->plcf->keyring, tctx->msg, tctx->len,
+                       tctx->plcf->gpg_timeout, tctx->vr);
+}
+
+
+/*
+ * Runs back on the WORKER event loop once the gpg thread finishes. Completes
+ * the request: the post-gpg validation (revocation, challenge MAC, single-use,
+ * grant) and the response, exactly as the synchronous path would -- only the
+ * blocking fork/wait happened off-loop.
+ */
+static void
+ngx_http_pgp_verify_thread_done(ngx_event_t *ev)
+{
+    ngx_int_t                       rc;
+    ngx_connection_t               *c;
+    ngx_http_request_t             *r;
+    ngx_http_pgp_thread_ctx_t      *tctx;
+    ngx_http_pgp_auth_loc_conf_t   *plcf;
+
+    r = ev->data;
+    c = r->connection;
+
+    ngx_http_set_log_request(c->log, r);
+
+    /*
+     * Watchdog timer: if it fires before the thread is really done, the thread
+     * is still running (it will fire this event again for real), so just note
+     * it and return without tearing anything down -- do NOT balance blocked/aio
+     * here. gpg has its own hard timeout, so this is only ever diagnostic.
+     */
+    if (ev->timedout) {
+        ev->timedout = 0;
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "pgp_auth: gpg verification thread is taking too long");
+        return;
+    }
+
+    if (ev->timer_set) {
+        ngx_del_timer(ev);
+    }
+
+    r->main->blocked--;
+    r->aio = 0;
+
+    tctx = ngx_http_get_module_ctx(r, ngx_http_pgp_auth_module);
+    plcf = ngx_http_get_module_loc_conf(r, ngx_http_pgp_auth_module);
+
+    if (tctx->gpg_rc != NGX_OK) {
+        rc = NGX_ERROR;
+    } else {
+        rc = ngx_http_pgp_verify_post(r, plcf, tctx->vr);
+    }
+
+    ngx_http_pgp_verify_finalize(r, plcf, rc);
+    ngx_http_run_posted_requests(c);
+}
+
+#endif
+
+
 /* Body post-handler: verify the submitted signature and finalize. */
 static void
 ngx_http_pgp_auth_submit(ngx_http_request_t *r)
 {
     ngx_int_t                       rc;
     ngx_str_t                       body, signed_msg;
+    ngx_http_pgp_verify_result_t   *vr;
     ngx_http_pgp_auth_loc_conf_t   *plcf;
+#if (NGX_THREADS)
+    ngx_thread_task_t              *task;
+    ngx_http_pgp_thread_ctx_t      *tctx;
+#endif
 
     plcf = ngx_http_get_module_loc_conf(r, ngx_http_pgp_auth_module);
 
@@ -1168,31 +1320,71 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
         signed_msg = body;     /* allow a raw (text/plain) clear-signed body */
     }
 
-    rc = ngx_http_pgp_verify_challenge(r, plcf, signed_msg.data,
-                                       signed_msg.len);
-
-    if (rc == NGX_HTTP_SEE_OTHER) {
-        /*
-         * Send the 303 ourselves (status + Set-Cookie + relative Location, no
-         * body). Going through nginx's special-response path instead would
-         * rewrite the Location to an absolute URL with nginx's own port.
-         */
-        rc = ngx_http_send_header(r);
-        if (rc == NGX_ERROR || rc > NGX_OK) {
-            ngx_http_finalize_request(r, rc);
-            return;
-        }
-        ngx_http_finalize_request(r, ngx_http_send_special(r, NGX_HTTP_LAST));
+    /* cheap pre-check in the worker, before any (blocking) gpg work */
+    if (ngx_http_pgp_verify_pre(r, signed_msg.data, signed_msg.len) != NGX_OK) {
+        ngx_http_finalize_request(r, ngx_http_pgp_send_challenge(r, plcf, 1));
         return;
     }
 
-    if (rc == NGX_ERROR) {
+    /* result lives in the request pool so it survives the async round-trip */
+    vr = ngx_palloc(r->pool, sizeof(ngx_http_pgp_verify_result_t));
+    if (vr == NULL) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
 
-    /* verification failed: re-serve the challenge with an error notice */
-    ngx_http_finalize_request(r, ngx_http_pgp_send_challenge(r, plcf, 1));
+#if (NGX_THREADS)
+    /*
+     * Preferred path: run the blocking gpg verification on a thread pool so the
+     * worker returns to its event loop immediately and keeps serving other
+     * requests. The request is pinned (blocked/aio) until the completion event
+     * fires. Falls through to synchronous below if a pool is not configured or
+     * the task cannot be posted.
+     */
+    if (plcf->thread_pool != NULL) {
+        task = ngx_thread_task_alloc(r->pool,
+                                     sizeof(ngx_http_pgp_thread_ctx_t));
+        if (task != NULL) {
+            tctx = task->ctx;
+            tctx->r = r;
+            tctx->plcf = plcf;
+            tctx->log = r->connection->log;
+            tctx->msg = signed_msg.data;
+            tctx->len = signed_msg.len;
+            tctx->gpg_rc = NGX_ERROR;
+            tctx->vr = vr;
+
+            task->handler = ngx_http_pgp_gpg_thread;
+            task->event.handler = ngx_http_pgp_verify_thread_done;
+            task->event.data = r;
+
+            if (ngx_thread_task_post(plcf->thread_pool, task) == NGX_OK) {
+                ngx_add_timer(&task->event, plcf->gpg_timeout + 10000);
+                r->main->blocked++;
+                r->aio = 1;
+                ngx_http_set_ctx(r, tctx, ngx_http_pgp_auth_module);
+                return;                       /* async verification in flight */
+            }
+        }
+
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "pgp_auth: could not post gpg to the thread pool; "
+                      "verifying synchronously");
+    }
+#endif
+
+    /* Synchronous fallback: fork gpg in the worker (non-threaded build, no
+     * pool configured, or the task could not be posted). */
+    if (ngx_http_pgp_gpg_verify(r->connection->log, &plcf->gpg_path,
+                                &plcf->keyring, signed_msg.data, signed_msg.len,
+                                plcf->gpg_timeout, vr) != NGX_OK)
+    {
+        rc = NGX_ERROR;
+    } else {
+        rc = ngx_http_pgp_verify_post(r, plcf, vr);
+    }
+
+    ngx_http_pgp_verify_finalize(r, plcf, rc);
 }
 
 
@@ -1406,10 +1598,32 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * exec rather than silently falling back to something PATH-resolved.
      */
     ngx_conf_merge_str_value(conf->gpg_path, prev->gpg_path, "/usr/bin/gpg");
+    ngx_conf_merge_str_value(conf->thread_pool_name, prev->thread_pool_name,
+                             "default");
 
     if (!conf->enable) {
         return NGX_CONF_OK;
     }
+
+#if (NGX_THREADS)
+    /*
+     * Resolve the thread pool that gpg verification runs on. Default is the
+     * "default" pool, auto-created if the operator didn't declare one, so a
+     * threaded nginx gets non-blocking verification with no extra config.
+     * "off" forces the synchronous path. On a build without thread support the
+     * directive is accepted and ignored (verification is always synchronous).
+     */
+    if (conf->thread_pool_name.len == 3
+        && ngx_strncmp(conf->thread_pool_name.data, "off", 3) == 0)
+    {
+        conf->thread_pool = NULL;
+    } else {
+        conf->thread_pool = ngx_thread_pool_add(cf, &conf->thread_pool_name);
+        if (conf->thread_pool == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+#endif
 
     if (conf->gpg_path.len == 0 || conf->gpg_path.data[0] != '/') {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,

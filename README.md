@@ -66,6 +66,7 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_revocation_fail_open` | `off` | Only applies when `pgp_revocation_list` is set: if that file can't be read, `off` denies access (fail closed), `on` allows. With no list configured, revocation is simply not in use and access is allowed. |
 | `pgp_gpg_path` | `/usr/bin/gpg` | Absolute path to the `gpg` binary. Must be absolute; the module `execve()`s it directly (no `$PATH` search, no inherited environment). |
 | `pgp_gpg_timeout` | `2s` | Max time for one gpg verification before it is killed. |
+| `pgp_gpg_thread_pool` | `default` | Name of the nginx `thread_pool` that gpg verification runs on, so the worker never blocks while `gpg` runs (see [SECURITY.md](SECURITY.md)). The `default` pool is auto-created if you don't declare one. Set `off` to force synchronous verification. On an nginx built without `--with-threads`, this is accepted and ignored — verification is synchronous. |
 | `pgp_auth_max_body_size` | `16k` | Reject a login body larger than this before reading it or spawning gpg. |
 
 All directives are valid at `http`, `server`, and `location` scope.

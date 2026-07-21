@@ -189,6 +189,14 @@ http {
             pgp_gpg_path /usr/bin/gpg;
             root $WORK/html;
         }
+        location /syncpool/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_gpg_thread_pool off;   # force synchronous verification
+            root $WORK/html;
+        }
         location /badgpgpath/ {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
@@ -591,6 +599,18 @@ curl -s -X POST "$base/gpgpath/?__pgp_auth=1" --data-urlencode "signed@$WORK/gp.
 grep -qi '^set-cookie:' "$WORK/hgp" \
     && ok "pgp_gpg_path /usr/bin/gpg: login still works" \
     || bad "pgp_gpg_path good-path login"
+
+# Thread pool: on a threaded nginx every other login here runs verification on
+# the pool (the default). /syncpool/ forces pgp_gpg_thread_pool off, exercising
+# the synchronous fallback path -- login must work identically either way.
+curl -s "$base/syncpool/" -o "$WORK/spA" >/dev/null
+SPCH2="$(challenge "$WORK/spA")"
+printf '%s' "$SPCH2" | gpg --clearsign --batch > "$WORK/sp2.asc" 2>/dev/null
+curl -s -X POST "$base/syncpool/?__pgp_auth=1" --data-urlencode "signed@$WORK/sp2.asc" \
+     -D "$WORK/hsp2" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hsp2" \
+    && ok "pgp_gpg_thread_pool off: synchronous fallback login works" \
+    || bad "pgp_gpg_thread_pool off login"
 
 # pgp_gpg_path pointing at a nonexistent binary: must fail *safely* (login
 # rejected, no crash, no 500) rather than falling back to a $PATH search.
