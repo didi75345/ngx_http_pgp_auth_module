@@ -71,17 +71,20 @@ So out of the box it is stateless apart from a local single-use cache; pick
 
 All directives are valid at `http`, `server`, and `location` scope.
 
-The login endpoint is unauthenticated and a submission forks a gpg verification,
-which occupies a worker for ~17–25 ms. Whether you need to rate-limit it depends
-on what else the instance serves:
+The login endpoint is unauthenticated and a submission forks a gpg verification.
+By default that runs on nginx's thread pool (`pgp_gpg_thread_pool default`), so
+the worker never blocks — a login flood cannot starve co-hosted sites, and the
+ceiling on concurrent verifications is the pool's thread count. A globally-keyed
+`limit_req` is still **recommended** here to bound pool threads, concurrent `gpg`
+processes and memory, but it is no longer what stands between an attacker and
+worker exhaustion.
 
-- **If this nginx also serves anything else** (a public site, another vhost),
-  a `limit_req` keyed **globally** — one bucket for the whole login endpoint —
-  is **required**: workers are a shared pool, so contention on the login
-  endpoint degrades everything else too.
-- **If this nginx serves only the protected location**, it's **recommended**
-  rather than required — the worst case is the admin itself being unavailable
-  during a flood, with nothing else at stake.
+In **synchronous mode** (`pgp_gpg_thread_pool off`, or an nginx built without
+`--with-threads`) a verification occupies the worker for ~17–25 ms, and a
+globally-keyed `limit_req` is **required** if this nginx serves anything else,
+since workers are then a shared pool and login contention degrades every other
+site. If it serves only the protected location, it is recommended rather than
+required.
 
 A **per-IP limit is never required and is not a substitute** — source addresses
 are cheap at cloud scale, and behind a Tor onion service or an unconfigured
