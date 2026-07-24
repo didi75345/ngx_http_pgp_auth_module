@@ -21,11 +21,47 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <limits.h>
 
 
 /* Upper bound on a single gpg verification before it is killed. */
 #define NGX_HTTP_PGP_GPG_TIMEOUT_MS  5000
+
+
+/*
+ * Record a diagnostic to be logged later by the worker (see F-003 note in the
+ * header). Keeps the first message set for this verification. Safe to call from
+ * a thread: it only writes into the caller-owned result buffer, never nginx's
+ * shared log.
+ */
+static void
+ngx_http_pgp_gpg_diag(ngx_http_pgp_verify_result_t *res, ngx_uint_t level,
+    const char *fmt, ...)
+{
+    va_list  args;
+    u_char  *p;
+
+    if (res == NULL || res->diag_level != 0) {
+        return;
+    }
+    va_start(args, fmt);
+    p = ngx_vslprintf(res->diag, res->diag + sizeof(res->diag) - 1,
+                      fmt, args);
+    va_end(args);
+    *p = '\0';
+    res->diag_level = level;
+}
+
+
+void
+ngx_http_pgp_gpg_log_diag(ngx_log_t *log, ngx_http_pgp_verify_result_t *res)
+{
+    if (res->diag_level != 0) {
+        ngx_log_error(res->diag_level, log, 0, "%s", res->diag);
+        res->diag_level = 0;
+    }
+}
 
 /* stringize a numeric macro so it can be passed as a gpg command-line arg */
 #define ngx_http_pgp_str2(x)       #x
@@ -103,9 +139,10 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     res->valid = 0;
     res->fpr_len = 0;
     res->plaintext_len = 0;
+    res->diag_level = 0;
 
     if (keyring->len == 0 || keyring->len >= PATH_MAX) {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
                       "pgp_auth: invalid keyring path");
         return NGX_ERROR;
     }
@@ -120,7 +157,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     if (gpg_path->len == 0 || gpg_path->len >= PATH_MAX
         || gpg_path->data[0] != '/')
     {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
                       "pgp_auth: invalid gpg binary path");
         return NGX_ERROR;
     }
@@ -143,8 +180,8 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
                         tmpdir);
 
     if (mkdtemp(home) == NULL) {
-        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
-                      "pgp_auth: mkdtemp() failed");
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+                      "pgp_auth: mkdtemp() failed (errno %d)", (int) ngx_errno);
         return NGX_ERROR;
     }
 
@@ -161,8 +198,9 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
      */
     fd = open(msgpath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd == -1) {
-        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
-                      "pgp_auth: open(%s) failed", msgpath);
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+                      "pgp_auth: open(%s) failed (errno %d)",
+                      msgpath, (int) ngx_errno);
         ngx_http_pgp_gpg_cleanup(home, NULL);
         return NGX_ERROR;
     }
@@ -177,7 +215,8 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     close(fd);
 
     if (pipe(pfd) == -1) {
-        ngx_log_error(NGX_LOG_ERR, log, ngx_errno, "pgp_auth: pipe() failed");
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+                      "pgp_auth: pipe() failed (errno %d)", (int) ngx_errno);
         ngx_http_pgp_gpg_cleanup(home, msgpath);
         return NGX_ERROR;
     }
@@ -196,7 +235,8 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
 
     pid = fork();
     if (pid == -1) {
-        ngx_log_error(NGX_LOG_ERR, log, ngx_errno, "pgp_auth: fork() failed");
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+                      "pgp_auth: fork() failed (errno %d)", (int) ngx_errno);
         sigprocmask(SIG_SETMASK, &prev, NULL);
         close(pfd[0]);
         close(pfd[1]);
@@ -208,6 +248,19 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
         int devnull;
 
         /*
+         * ============================ WARNING ============================
+         * ASYNC-SIGNAL-SAFE ZONE. Everything from here to execve()/_exit()
+         * runs in the forked child. gpg is forked from a THREAD-POOL thread
+         * (see ngx_http_pgp_gpg_thread), so the process is multithreaded at
+         * fork time: only the child's thread survives, but any lock another
+         * thread held is now frozen forever in the child. So this region MUST
+         * call only async-signal-safe functions (POSIX signal-safety(7)) --
+         * no malloc/free, no ngx_log or printf calls, no ngx_ helpers, nothing
+         * that can take a lock. Currently only dup2/open/close/close_range/
+         * sigprocmask/execve are used, all of which are safe. Do NOT add a
+         * log call or an allocation here. (Pentest CCS F-002.)
+         * ================================================================
+         *
          * child: machine-readable status goes to the pipe (stdout, via
          * --status-fd 1); the verified plaintext goes to --output plainpath;
          * and gpg's human-readable chatter (stderr) is discarded. Keeping the
@@ -298,7 +351,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
 
         if (left <= 0) {
             kill(pid, SIGKILL);
-            ngx_log_error(NGX_LOG_ERR, log, 0,
+            ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
                           "pgp_auth: gpg verify timed out, killed");
             break;
         }
@@ -306,7 +359,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
         n = poll(&pe, 1, (int) left);
         if (n == 0) {
             kill(pid, SIGKILL);
-            ngx_log_error(NGX_LOG_ERR, log, 0,
+            ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
                           "pgp_auth: gpg verify timed out, killed");
             break;
         }
@@ -479,7 +532,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     }
 
     if (truncated) {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
                       "pgp_auth: gpg output truncated; rejecting");
     }
 
@@ -508,7 +561,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
             }
         }
 
-        ngx_log_error(NGX_LOG_WARN, log, 0,
+        ngx_http_pgp_gpg_diag(res, NGX_LOG_WARN,
                       "pgp_auth: gpg verify produced no valid signature "
                       "(keyring \"%V\", exit %d): %s",
                       keyring, code, out[0] ? out : "(no output)");
