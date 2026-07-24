@@ -35,8 +35,8 @@
  * a thread: it only writes into the caller-owned result buffer, never nginx's
  * shared log.
  */
-static void
-ngx_http_pgp_gpg_diag(ngx_http_pgp_verify_result_t *res, ngx_uint_t level,
+void
+ngx_http_pgp_defer_diag(ngx_http_pgp_verify_result_t *res, ngx_uint_t level,
     const char *fmt, ...)
 {
     va_list  args;
@@ -142,7 +142,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     res->diag_level = 0;
 
     if (keyring->len == 0 || keyring->len >= PATH_MAX) {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: invalid keyring path");
         return NGX_ERROR;
     }
@@ -157,7 +157,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     if (gpg_path->len == 0 || gpg_path->len >= PATH_MAX
         || gpg_path->data[0] != '/')
     {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: invalid gpg binary path");
         return NGX_ERROR;
     }
@@ -180,7 +180,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
                         tmpdir);
 
     if (mkdtemp(home) == NULL) {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: mkdtemp() failed (errno %d)", (int) ngx_errno);
         return NGX_ERROR;
     }
@@ -198,7 +198,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
      */
     fd = open(msgpath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd == -1) {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: open(%s) failed (errno %d)",
                       msgpath, (int) ngx_errno);
         ngx_http_pgp_gpg_cleanup(home, NULL);
@@ -215,7 +215,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     close(fd);
 
     if (pipe(pfd) == -1) {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: pipe() failed (errno %d)", (int) ngx_errno);
         ngx_http_pgp_gpg_cleanup(home, msgpath);
         return NGX_ERROR;
@@ -235,7 +235,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
 
     pid = fork();
     if (pid == -1) {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: fork() failed (errno %d)", (int) ngx_errno);
         sigprocmask(SIG_SETMASK, &prev, NULL);
         close(pfd[0]);
@@ -351,7 +351,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
 
         if (left <= 0) {
             kill(pid, SIGKILL);
-            ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+            ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                           "pgp_auth: gpg verify timed out, killed");
             break;
         }
@@ -359,7 +359,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
         n = poll(&pe, 1, (int) left);
         if (n == 0) {
             kill(pid, SIGKILL);
-            ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+            ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                           "pgp_auth: gpg verify timed out, killed");
             break;
         }
@@ -532,7 +532,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     }
 
     if (truncated) {
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_ERR,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_ERR,
                       "pgp_auth: gpg output truncated; rejecting");
     }
 
@@ -561,7 +561,7 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
             }
         }
 
-        ngx_http_pgp_gpg_diag(res, NGX_LOG_WARN,
+        ngx_http_pgp_defer_diag(res, NGX_LOG_WARN,
                       "pgp_auth: gpg verify produced no valid signature "
                       "(keyring \"%V\", exit %d): %s",
                       keyring, code, out[0] ? out : "(no output)");

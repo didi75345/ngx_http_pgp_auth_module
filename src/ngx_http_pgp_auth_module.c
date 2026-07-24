@@ -94,6 +94,8 @@ typedef struct {
     ngx_log_t                     *log;
     u_char                        *msg;
     size_t                         len;
+    ngx_str_t                      ip;       /* client binding, captured on  */
+    ngx_str_t                      ua;       /* the worker before posting    */
     ngx_int_t                      gpg_rc;   /* return of gpg_verify         */
     ngx_http_pgp_verify_result_t  *vr;       /* filled by the thread         */
 } ngx_http_pgp_thread_ctx_t;
@@ -367,64 +369,108 @@ ngx_module_t  ngx_http_pgp_auth_module = {
  * NOTE: behind a reverse proxy the client IP nginx sees is the proxy's unless
  * ngx_http_realip_module is configured; see SECURITY.md.
  */
+/*
+ * Thread-safe HMAC core. Takes the binding values explicitly and writes 64 hex
+ * chars into `out64`; allocates nothing from the request pool and touches no
+ * request state, so it is safe to call from a thread-pool thread (the async
+ * verification path runs the challenge MAC there). Uses the streaming HMAC API
+ * so a long User-Agent needs no large contiguous buffer.
+ *
+ *   layout: kind || 0x1e || data || 0x1e || ip || 0x1e || ua
+ */
+static ngx_int_t
+ngx_http_pgp_hmac_raw(ngx_str_t *secret, const char *kind, ngx_str_t *ip,
+    ngx_str_t *ua, u_char *data, size_t len, u_char *out64)
+{
+    unsigned int   mdlen;
+    unsigned char  md[EVP_MAX_MD_SIZE];
+    u_char         sep = 0x1e;
+    HMAC_CTX      *ctx;
+
+    ctx = HMAC_CTX_new();
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (HMAC_Init_ex(ctx, secret->data, (int) secret->len, EVP_sha256(), NULL)
+            != 1
+        || HMAC_Update(ctx, (u_char *) kind, ngx_strlen(kind)) != 1
+        || HMAC_Update(ctx, &sep, 1) != 1
+        || HMAC_Update(ctx, data, len) != 1
+        || HMAC_Update(ctx, &sep, 1) != 1
+        || HMAC_Update(ctx, ip->data, ip->len) != 1
+        || HMAC_Update(ctx, &sep, 1) != 1
+        || HMAC_Update(ctx, ua->data, ua->len) != 1
+        || HMAC_Final(ctx, md, &mdlen) != 1)
+    {
+        HMAC_CTX_free(ctx);
+        return NGX_ERROR;
+    }
+
+    HMAC_CTX_free(ctx);
+    ngx_hex_dump(out64, md, mdlen);
+    return NGX_OK;
+}
+
+
+/*
+ * Read the client binding (IP / User-Agent) selected by pgp_auth_bind_* from
+ * the request. Both are stable for the life of the request, so the async path
+ * captures them on the worker and hands them to the thread.
+ */
+static void
+ngx_http_pgp_binding(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_str_t *ip, ngx_str_t *ua)
+{
+    ngx_str_null(ip);
+    ngx_str_null(ua);
+
+    if (plcf->bind_ip) {
+        *ip = r->connection->addr_text;
+    }
+    if (plcf->bind_ua && r->headers_in.user_agent != NULL) {
+        *ua = r->headers_in.user_agent->value;
+    }
+}
+
+
+/*
+ * HMAC-SHA256(secret, kind || data [|| client binding]) hex into out (from the
+ * request pool). Worker-side convenience wrapper over ngx_http_pgp_hmac_raw().
+ *
+ * Domain separation: every MAC input is prefixed with a context label ("chal"
+ * for a challenge, "sess" for a session cookie), so the two token types can
+ * never produce the same MAC regardless of how their pipe-delimited layouts or
+ * parsers later evolve -- otherwise a future format change could let a freely
+ * obtainable challenge validate as a session cookie (a full auth bypass).
+ *
+ * Client binding: when pgp_auth_bind_client_ip / _user_agent are on, the IP
+ * and/or User-Agent are folded in, so a token lifted to a different client no
+ * longer validates. Behind a reverse proxy the IP is the proxy's unless
+ * ngx_http_realip_module is configured; see SECURITY.md.
+ */
 static ngx_int_t
 ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
     ngx_http_pgp_auth_loc_conf_t *plcf, const char *kind, u_char *data,
     size_t len, ngx_str_t *out)
 {
-    unsigned int   mdlen;
-    unsigned char  md[EVP_MAX_MD_SIZE];
-    ngx_str_t      ip, ua;
-    u_char        *buf, *b;
-    size_t         klen, total;
+    ngx_str_t  ip, ua;
+    u_char     hex[64];
 
-    ngx_str_null(&ip);
-    ngx_str_null(&ua);
+    ngx_http_pgp_binding(r, plcf, &ip, &ua);
 
-    if (plcf->bind_ip) {
-        ip = r->connection->addr_text;
-    }
-    if (plcf->bind_ua && r->headers_in.user_agent != NULL) {
-        ua = r->headers_in.user_agent->value;
-    }
-
-    /*
-     * Domain separation: every MAC input is prefixed with a context label
-     * ("chal" for a challenge, "sess" for a session cookie), so the two token
-     * types can never produce the same MAC regardless of how their
-     * pipe-delimited layouts or parsers later evolve. Otherwise both are just
-     * HMAC(secret, <differently-shaped-but-unlabelled data>), and a future
-     * format change could let a freely obtainable challenge validate as a
-     * session cookie -- a full auth bypass. This is the invariant, not the
-     * parsers' current field counts, that keeps them apart.
-     *   layout: kind || 0x1e || data || 0x1e || ip || 0x1e || ua
-     */
-    klen = ngx_strlen(kind);
-    total = klen + 1 + len + 1 + ip.len + 1 + ua.len;
-    buf = ngx_pnalloc(r->pool, total);
-    if (buf == NULL) {
-        return NGX_ERROR;
-    }
-    b = ngx_cpymem(buf, (u_char *) kind, klen);
-    *b++ = 0x1e;
-    b = ngx_cpymem(b, data, len);
-    *b++ = 0x1e;
-    b = ngx_cpymem(b, ip.data, ip.len);
-    *b++ = 0x1e;
-    ngx_memcpy(b, ua.data, ua.len);
-
-    if (HMAC(EVP_sha256(), plcf->secret.data, (int) plcf->secret.len,
-             buf, total, md, &mdlen) == NULL)
+    if (ngx_http_pgp_hmac_raw(&plcf->secret, kind, &ip, &ua, data, len, hex)
+        != NGX_OK)
     {
         return NGX_ERROR;
     }
 
-    out->data = ngx_pnalloc(r->pool, mdlen * 2);
+    out->data = ngx_pnalloc(r->pool, sizeof(hex));
     if (out->data == NULL) {
         return NGX_ERROR;
     }
-    ngx_hex_dump(out->data, md, mdlen);
-    out->len = mdlen * 2;
+    ngx_memcpy(out->data, hex, sizeof(hex));
+    out->len = sizeof(hex);
 
     return NGX_OK;
 }
@@ -734,27 +780,25 @@ ngx_http_pgp_verify_pre(ngx_http_request_t *r, u_char *msg, size_t len)
  * pre-check and the gpg call so it can run either inline (sync) or from the
  * thread-pool completion handler (async) -- see ngx_http_pgp_auth_submit.
  */
+/*
+ * Validate the challenge inside the SIGNED plaintext (MAC + expiry) and consume
+ * its single-use nonce. THREAD-SAFE: it reads only `vr`, the read-only loc conf
+ * and the caller-supplied binding; it allocates nothing from the request pool,
+ * touches no request state, and logs nothing directly (diagnostics are deferred
+ * into vr->diag). So the async path runs this on the verification thread right
+ * after gpg -- keeping the (possibly blocking, Redis) nonce round-trip off the
+ * worker as well (Pentest CCS F-001). Returns NGX_OK / NGX_DECLINED / NGX_ERROR.
+ */
 static ngx_int_t
-ngx_http_pgp_verify_post(ngx_http_request_t *r,
-    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_http_pgp_verify_result_t *vr)
+ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_str_t *ip, ngx_str_t *ua)
 {
-    time_t       exp;
-    u_char      *p, *last, *line_end, *s1, *s2, *s3;
-    ngx_str_t    payload, mac_have, mac_want, fpr;
-
-    if (!vr->valid) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "pgp_auth: signature not from a keyring key");
-        return NGX_DECLINED;
-    }
-
-    fpr.data = vr->fpr;
-    fpr.len = vr->fpr_len;
-    if (ngx_http_pgp_is_revoked(r, plcf, &fpr)) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "pgp_auth: signing key is revoked");
-        return NGX_DECLINED;
-    }
+    time_t                     exp;
+    u_char                    *p, *last, *line_end, *s1, *s2, *s3;
+    u_char                     mac_bytes[64];
+    ngx_int_t                  rc;
+    ngx_str_t                  nonce, mac_have, mac_want;
+    ngx_http_pgp_nonce_conf_t  nc;
 
     /* locate our challenge line ("v1|...") inside the SIGNED plaintext */
     last = vr->plaintext + vr->plaintext_len;
@@ -764,7 +808,7 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
         }
     }
     if (p + 3 > last) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
                       "pgp_auth: no challenge inside the signed content");
         return NGX_DECLINED;
     }
@@ -785,26 +829,25 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
     s3 = ngx_strlchr(s2 + 1, line_end, '|');                  /* after nonce*/
     if (s3 == NULL) { return NGX_DECLINED; }
 
-    payload.data = p;
-    payload.len = s3 - p;                                     /* v1|exp|nonce */
-
-    mac_have.data = s3 + 1;
-    mac_have.len = line_end - (s3 + 1);
-
-    if (ngx_http_pgp_hmac_hex(r, plcf, "chal", payload.data, payload.len,
-                              &mac_want) != NGX_OK)
+    if (ngx_http_pgp_hmac_raw(&plcf->secret, "chal", ip, ua, p, s3 - p,
+                              mac_bytes) != NGX_OK)
     {
         return NGX_ERROR;
     }
+    mac_want.data = mac_bytes;
+    mac_want.len = sizeof(mac_bytes);
+    mac_have.data = s3 + 1;
+    mac_have.len = line_end - (s3 + 1);
+
     if (!ngx_http_pgp_ct_eq(&mac_have, &mac_want)) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
                       "pgp_auth: challenge MAC mismatch");
         return NGX_DECLINED;
     }
 
     exp = ngx_atotm(s1 + 1, s2 - (s1 + 1));
     if (exp == NGX_ERROR || exp < ngx_time()) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
                       "pgp_auth: challenge expired");
         return NGX_DECLINED;
     }
@@ -814,35 +857,70 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
      * was already used. Fails closed (rejects) if the backend errors, so a
      * misconfigured/unreachable store never silently disables replay defence.
      */
-    {
-        ngx_str_t  nonce;
-        ngx_int_t  rc;
+    nonce.data = s2 + 1;
+    nonce.len = s3 - (s2 + 1);
 
-        nonce.data = s2 + 1;
-        nonce.len = s3 - (s2 + 1);
+    nc.storage    = plcf->nonce_storage;
+    nc.zone       = plcf->nonce_zone;
+    nc.addr       = plcf->nonce_addr;
+    nc.password   = plcf->nonce_password;
+    nc.tls        = plcf->nonce_tls;
+    nc.tls_verify = plcf->nonce_tls_verify;
+    nc.tls_ca     = plcf->nonce_tls_ca;
+    nc.tls_name   = plcf->nonce_tls_name;
 
-        ngx_http_pgp_nonce_conf_t  nc;
+    rc = ngx_http_pgp_nonce_check_and_set(vr, &nc, &nonce, exp);
+    if (rc == NGX_DECLINED) {
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
+                      "pgp_auth: challenge already used (replay)");
+        return NGX_DECLINED;
+    }
+    if (rc != NGX_OK) {
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
+                      "pgp_auth: nonce store error; rejecting");
+        return NGX_DECLINED;
+    }
 
-        nc.storage    = plcf->nonce_storage;
-        nc.zone       = plcf->nonce_zone;
-        nc.addr       = plcf->nonce_addr;
-        nc.password   = plcf->nonce_password;
-        nc.tls        = plcf->nonce_tls;
-        nc.tls_verify = plcf->nonce_tls_verify;
-        nc.tls_ca     = plcf->nonce_tls_ca;
-        nc.tls_name   = plcf->nonce_tls_name;
+    return NGX_OK;
+}
 
-        rc = ngx_http_pgp_nonce_check_and_set(r, &nc, &nonce, exp);
-        if (rc == NGX_DECLINED) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "pgp_auth: challenge already used (replay)");
-            return NGX_DECLINED;
-        }
-        if (rc != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "pgp_auth: nonce store error; rejecting");
-            return NGX_DECLINED;
-        }
+
+static ngx_int_t
+ngx_http_pgp_verify_post(ngx_http_request_t *r,
+    ngx_http_pgp_auth_loc_conf_t *plcf, ngx_http_pgp_verify_result_t *vr)
+{
+    ngx_int_t  rc;
+    ngx_str_t  ip, ua, fpr;
+
+    if (!vr->valid) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: signature not from a keyring key");
+        return NGX_DECLINED;
+    }
+
+    /* Revocation stays on the worker: it maintains a per-worker file cache and
+     * so is not thread-safe. It runs before grant either way. */
+    fpr.data = vr->fpr;
+    fpr.len = vr->fpr_len;
+    if (ngx_http_pgp_is_revoked(r, plcf, &fpr)) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "pgp_auth: signing key is revoked");
+        return NGX_DECLINED;
+    }
+
+    /*
+     * Challenge MAC/expiry + single-use nonce. On the async path the thread has
+     * already done this (so any blocking Redis round-trip was off the worker);
+     * use its result. On the sync path, do it here with this request's binding.
+     */
+    if (vr->chal_done) {
+        rc = vr->chal_rc;
+    } else {
+        ngx_http_pgp_binding(r, plcf, &ip, &ua);
+        rc = ngx_http_pgp_validate_consume(vr, plcf, &ip, &ua);
+    }
+    if (rc != NGX_OK) {
+        return rc;
     }
 
     fpr.data = vr->fpr;
@@ -1226,6 +1304,19 @@ ngx_http_pgp_gpg_thread(void *data, ngx_log_t *log)
     tctx->gpg_rc = ngx_http_pgp_gpg_verify(tctx->log, &tctx->plcf->gpg_path,
                        &tctx->plcf->keyring, tctx->msg, tctx->len,
                        tctx->plcf->gpg_timeout, tctx->vr);
+
+    /*
+     * Also do the challenge MAC/expiry check and consume the single-use nonce
+     * here, off the worker -- so a blocking Redis nonce round-trip never lands
+     * back on the event loop (Pentest CCS F-001). Only when gpg produced a good
+     * keyring signature; otherwise the worker rejects on !valid anyway, and we
+     * must not consume a nonce for an unauthenticated attempt.
+     */
+    if (tctx->gpg_rc == NGX_OK && tctx->vr->valid) {
+        tctx->vr->chal_rc = ngx_http_pgp_validate_consume(tctx->vr, tctx->plcf,
+                                &tctx->ip, &tctx->ua);
+        tctx->vr->chal_done = 1;
+    }
 }
 
 
@@ -1336,6 +1427,7 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
+    vr->chal_done = 0;     /* set by the thread on the async path */
 
 #if (NGX_THREADS)
     /*
@@ -1357,6 +1449,9 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
             tctx->len = signed_msg.len;
             tctx->gpg_rc = NGX_ERROR;
             tctx->vr = vr;
+            /* capture the client binding on the worker; the thread must not
+             * touch the request, and these strings are stable for its life */
+            ngx_http_pgp_binding(r, plcf, &tctx->ip, &tctx->ua);
 
             task->handler = ngx_http_pgp_gpg_thread;
             task->event.handler = ngx_http_pgp_verify_thread_done;

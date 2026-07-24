@@ -20,6 +20,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include "ngx_http_pgp_auth_gpg.h"   /* ngx_http_pgp_verify_result_t, defer_diag */
+
 #define NGX_HTTP_PGP_NONCE_NONE    0
 #define NGX_HTTP_PGP_NONCE_MEMORY  1
 #define NGX_HTTP_PGP_NONCE_REDIS   2
@@ -50,7 +52,7 @@ ngx_shm_zone_t *ngx_http_pgp_nonce_add_zone(ngx_conf_t *cf, size_t size);
  *   NGX_ERROR    - backend failure
  * For NGX_HTTP_PGP_NONCE_NONE this is a no-op returning NGX_OK.
  */
-ngx_int_t ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r,
+ngx_int_t ngx_http_pgp_nonce_check_and_set(ngx_http_pgp_verify_result_t *vr,
     ngx_http_pgp_nonce_conf_t *nc, ngx_str_t *nonce, time_t exp);
 
 #endif /* NGX_HTTP_PGP_AUTH_NONCE_H */
