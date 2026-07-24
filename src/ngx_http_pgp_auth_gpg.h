@@ -28,6 +28,15 @@ typedef struct {
      */
     u_char     plaintext[NGX_HTTP_PGP_PLAINTEXT_MAX];
     size_t     plaintext_len;
+
+    /*
+     * Deferred diagnostic. gpg verification can run on a thread-pool thread,
+     * where nginx's logging is not thread-safe (Pentest CCS F-003). So
+     * gpg_verify never logs itself: it records its message here and the caller
+     * emits it from the worker event loop via ngx_http_pgp_gpg_log_diag().
+     */
+    ngx_uint_t diag_level;          /* 0 = nothing to log */
+    u_char     diag[256];
 } ngx_http_pgp_verify_result_t;
 
 /*
@@ -39,6 +48,14 @@ typedef struct {
  */
 ngx_int_t ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     ngx_str_t *keyring, u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
+    ngx_http_pgp_verify_result_t *res);
+
+/*
+ * Emit the diagnostic gpg_verify recorded (if any), then clear it. MUST be
+ * called from the worker event loop, never a thread -- this is what keeps
+ * verification logging thread-safe (Pentest CCS F-003).
+ */
+void ngx_http_pgp_gpg_log_diag(ngx_log_t *log,
     ngx_http_pgp_verify_result_t *res);
 
 #endif /* NGX_HTTP_PGP_AUTH_GPG_H */

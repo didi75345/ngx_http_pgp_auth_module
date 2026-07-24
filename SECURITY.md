@@ -222,6 +222,21 @@ a login flood because no worker is ever blocked on gpg. The thing to size is the
 pool (`thread_pool name threads=N`) and the number of concurrent `gpg`
 *processes* it implies (one per busy thread).
 
+> **One exception — the Redis nonce backend (Pentest CCS F-001).** Only the gpg
+> step runs on the pool thread; the single-use nonce check runs back on the
+> worker when the thread completes. For the default `memory` backend that is an
+> in-process shared-memory lookup with no I/O, so the worker is not blocked. But
+> with `pgp_auth_nonce_storage redis`, that check is a per-login connect →
+> (TLS handshake →) `SET NX` round-trip on the worker, bounded by the client's
+> 500 ms poll timeouts (≈1.5 s worst case, a little more with TLS). It fails
+> closed. So the Redis backend reintroduces *bounded* per-login worker blocking
+> for the nonce step only — much smaller than the original synchronous gpg
+> design, but not zero. Keep the global `limit_req` in place when using it, run
+> Redis close by (low round-trip), and prefer the default `memory` backend
+> unless you genuinely need single-use enforcement shared across nodes. Moving
+> this check onto the pool thread (or an event-loop-driven Redis client) is a
+> planned improvement.
+
 **Synchronous mode (`pgp_gpg_thread_pool off`, or an nginx built without
 `--with-threads`).** Here a verification does occupy the worker for its
 duration, so the number of workers tied up at any moment is bounded by:
@@ -331,6 +346,12 @@ operator should do about them.
   you name the expected identity with `pgp_auth_nonce_storage_tls_name`, which
   is also sent as SNI. Verification failure fails the login closed rather than
   falling back to cleartext.
+
+  Setting `pgp_auth_nonce_storage_tls_verify off` selects `SSL_VERIFY_NONE` — an
+  encrypted but **unauthenticated** channel, open to a man-in-the-middle who can
+  then answer the single-use `SET NX` and silently defeat replay protection.
+  Verification is on by default and should be turned off only in controlled test
+  environments, never in production. (Pentest CCS F-004.)
 
 - **The Redis address must be a numeric `ip:port`.** Resolution is done with no
   DNS lookup (see above), so hostnames are rejected. IPv4 is the tested form;

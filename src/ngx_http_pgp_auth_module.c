@@ -1272,6 +1272,10 @@ ngx_http_pgp_verify_thread_done(ngx_event_t *ev)
     tctx = ngx_http_get_module_ctx(r, ngx_http_pgp_auth_module);
     plcf = ngx_http_get_module_loc_conf(r, ngx_http_pgp_auth_module);
 
+    /* Emit any diagnostic the thread recorded -- on the worker loop, so
+     * verification logging stays thread-safe (Pentest CCS F-003). */
+    ngx_http_pgp_gpg_log_diag(c->log, tctx->vr);
+
     if (tctx->gpg_rc != NGX_OK) {
         rc = NGX_ERROR;
     } else {
@@ -1384,6 +1388,7 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
         rc = ngx_http_pgp_verify_post(r, plcf, vr);
     }
 
+    ngx_http_pgp_gpg_log_diag(r->connection->log, vr);
     ngx_http_pgp_verify_finalize(r, plcf, rc);
 }
 
