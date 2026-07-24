@@ -37,6 +37,15 @@ typedef struct {
      */
     ngx_uint_t diag_level;          /* 0 = nothing to log */
     u_char     diag[256];
+
+    /*
+     * Async path: the challenge MAC/expiry check and the single-use nonce
+     * consumption run on the verification thread, right after gpg, so the
+     * (possibly blocking) Redis nonce round-trip stays off the worker too
+     * (Pentest CCS F-001). The worker reads the outcome here.
+     */
+    ngx_uint_t chal_done;           /* 1 = the thread already validated+consumed */
+    ngx_int_t  chal_rc;             /* NGX_OK / NGX_DECLINED / NGX_ERROR */
 } ngx_http_pgp_verify_result_t;
 
 /*
@@ -51,8 +60,17 @@ ngx_int_t ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     ngx_http_pgp_verify_result_t *res);
 
 /*
- * Emit the diagnostic gpg_verify recorded (if any), then clear it. MUST be
- * called from the worker event loop, never a thread -- this is what keeps
+ * Record a diagnostic for the worker to log later (keeps the first one set).
+ * Thread-safe: writes only into the caller-owned result buffer, never nginx's
+ * shared log. Used by any code that can run on the verification thread (gpg and
+ * the nonce backends). (Pentest CCS F-003.)
+ */
+void ngx_http_pgp_defer_diag(ngx_http_pgp_verify_result_t *res,
+    ngx_uint_t level, const char *fmt, ...);
+
+/*
+ * Emit the diagnostic recorded above (if any), then clear it. MUST be called
+ * from the worker event loop, never a thread -- this is what keeps
  * verification logging thread-safe (Pentest CCS F-003).
  */
 void ngx_http_pgp_gpg_log_diag(ngx_log_t *log,

@@ -143,7 +143,8 @@ ngx_http_pgp_nonce_evict_expired(ngx_http_pgp_nonce_ctx_t *ctx, time_t now,
 
 
 static ngx_int_t
-ngx_http_pgp_nonce_memory(ngx_http_request_t *r, ngx_shm_zone_t *zone,
+ngx_http_pgp_nonce_memory(ngx_http_pgp_verify_result_t *vr,
+    ngx_shm_zone_t *zone,
     ngx_str_t *nonce, time_t exp)
 {
     size_t                      size;
@@ -196,7 +197,7 @@ ngx_http_pgp_nonce_memory(ngx_http_request_t *r, ngx_shm_zone_t *zone,
         n = ngx_slab_alloc_locked(ctx->shpool, size);
         if (n == NULL) {
             ngx_shmtx_unlock(&ctx->shpool->mutex);
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                           "pgp_auth: nonce zone full with no expired entries to "
                           "reclaim; denying login (raise pgp_auth_nonce_zone_size, "
                           "or use pgp_auth_nonce_storage redis)");
@@ -312,7 +313,7 @@ ngx_http_pgp_nonce_wait(int fd, short ev, int timeout_ms)
  * Returns the SSL* (caller frees it and *ctx_out) or NULL on failure.
  */
 static SSL *
-ngx_http_pgp_nonce_tls(ngx_http_request_t *r, int fd, const char *host,
+ngx_http_pgp_nonce_tls(ngx_http_pgp_verify_result_t *vr, int fd, const char *host,
     ngx_flag_t verify, ngx_str_t *ca, ngx_str_t *name, SSL_CTX **ctx_out)
 {
     int                 rc;
@@ -337,7 +338,7 @@ ngx_http_pgp_nonce_tls(ngx_http_request_t *r, int fd, const char *host,
             ngx_memcpy(buf, ca->data, ca->len);
             buf[ca->len] = '\0';
             if (SSL_CTX_load_verify_locations(ctx, buf, NULL) != 1) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                               "pgp_auth: redis TLS: cannot load CA \"%V\"", ca);
                 goto failed;
             }
@@ -393,7 +394,7 @@ ngx_http_pgp_nonce_tls(ngx_http_request_t *r, int fd, const char *host,
                 continue;
             }
         }
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: redis TLS handshake failed "
                       "(verify=%d, cert must match %s)",
                       (int) verify, name->len ? "the configured tls_name"
@@ -490,7 +491,7 @@ ngx_http_pgp_nonce_redis_roundtrip(int fd, SSL *ssl, const char *cmd,
 
 
 static ngx_int_t
-ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
+ngx_http_pgp_nonce_redis(ngx_http_pgp_verify_result_t *vr, ngx_http_pgp_nonce_conf_t *nc,
     ngx_str_t *nonce, time_t exp)
 {
     int               fd = -1, err;
@@ -539,7 +540,7 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
     if (getaddrinfo(host, colon + 1, &hints, &ai) != 0) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: redis address \"%s\" is not a numeric host:port "
                       "(hostnames are not supported; use an IP)", host);
         return NGX_ERROR;
@@ -570,7 +571,7 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
     freeaddrinfo(ai);
 
     if (fd == -1) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: redis connect failed");
         return NGX_ERROR;
     }
@@ -580,7 +581,7 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
      * and the nonce must never cross the network in clear when TLS is enabled.
      */
     if (nc->tls) {
-        ssl = ngx_http_pgp_nonce_tls(r, fd, host, nc->tls_verify, &nc->tls_ca,
+        ssl = ngx_http_pgp_nonce_tls(vr, fd, host, nc->tls_verify, &nc->tls_ca,
                                      &nc->tls_name, &ssl_ctx);
         if (ssl == NULL) {
             close(fd);
@@ -601,7 +602,7 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
         k = ngx_http_pgp_nonce_redis_roundtrip(fd, ssl, buf, off, reply,
                                                sizeof(reply));
         if (k <= 0 || reply[0] != '+') {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                           "pgp_auth: redis AUTH failed");
             goto done;
         }
@@ -639,7 +640,7 @@ ngx_http_pgp_nonce_redis(ngx_http_request_t *r, ngx_http_pgp_nonce_conf_t *nc,
         rc = NGX_DECLINED;
 
     } else if (reply[0] == '-') {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: redis error reply: %s", reply);
     }
 
@@ -658,16 +659,16 @@ done:
 
 
 ngx_int_t
-ngx_http_pgp_nonce_check_and_set(ngx_http_request_t *r,
+ngx_http_pgp_nonce_check_and_set(ngx_http_pgp_verify_result_t *vr,
     ngx_http_pgp_nonce_conf_t *nc, ngx_str_t *nonce, time_t exp)
 {
     switch (nc->storage) {
 
     case NGX_HTTP_PGP_NONCE_MEMORY:
-        return ngx_http_pgp_nonce_memory(r, nc->zone, nonce, exp);
+        return ngx_http_pgp_nonce_memory(vr, nc->zone, nonce, exp);
 
     case NGX_HTTP_PGP_NONCE_REDIS:
-        return ngx_http_pgp_nonce_redis(r, nc, nonce, exp);
+        return ngx_http_pgp_nonce_redis(vr, nc, nonce, exp);
 
     default:                                           /* NONE */
         return NGX_OK;

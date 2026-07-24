@@ -222,20 +222,16 @@ a login flood because no worker is ever blocked on gpg. The thing to size is the
 pool (`thread_pool name threads=N`) and the number of concurrent `gpg`
 *processes* it implies (one per busy thread).
 
-> **One exception — the Redis nonce backend (Pentest CCS F-001).** Only the gpg
-> step runs on the pool thread; the single-use nonce check runs back on the
-> worker when the thread completes. For the default `memory` backend that is an
-> in-process shared-memory lookup with no I/O, so the worker is not blocked. But
-> with `pgp_auth_nonce_storage redis`, that check is a per-login connect →
-> (TLS handshake →) `SET NX` round-trip on the worker, bounded by the client's
-> 500 ms poll timeouts (≈1.5 s worst case, a little more with TLS). It fails
-> closed. So the Redis backend reintroduces *bounded* per-login worker blocking
-> for the nonce step only — much smaller than the original synchronous gpg
-> design, but not zero. Keep the global `limit_req` in place when using it, run
-> Redis close by (low round-trip), and prefer the default `memory` backend
-> unless you genuinely need single-use enforcement shared across nodes. Moving
-> this check onto the pool thread (or an event-loop-driven Redis client) is a
-> planned improvement.
+> **The single-use nonce check runs on the pool thread too (Pentest CCS
+> F-001).** Right after gpg, the same thread validates the challenge MAC/expiry
+> and consumes the nonce, so a blocking `pgp_auth_nonce_storage redis` round-trip
+> — connect → (TLS handshake →) `SET NX` — happens off the worker as well, not
+> just gpg. The worker is never blocked on the nonce store in either backend
+> (`memory` is a lock-guarded in-process lookup anyway). The Redis client is
+> still bounded by its 500 ms poll timeouts and fails closed. Keep the global
+> `limit_req` in place: it now bounds *pool-thread* occupancy (busy threads →
+> stalled logins, and one open Redis socket + `gpg` process per busy thread)
+> rather than worker blocking.
 
 **Synchronous mode (`pgp_gpg_thread_pool off`, or an nginx built without
 `--with-threads`).** Here a verification does occupy the worker for its
