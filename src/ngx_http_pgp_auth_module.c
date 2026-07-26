@@ -32,9 +32,13 @@
 
 #include "ngx_http_pgp_auth_gpg.h"
 #include "ngx_http_pgp_auth_nonce.h"
+#include "ngx_http_pgp_auth_throttle.h"
 
 #if (NGX_THREADS)
 #include <ngx_thread_pool.h>
+
+#include <sys/mman.h>
+#include <sys/resource.h>
 #endif
 
 
@@ -58,9 +62,16 @@ typedef struct {
     ngx_flag_t   bind_ua;             /* mix User-Agent into the HMAC       */
     ngx_uint_t   nonce_storage;       /* none | memory | redis              */
     ngx_shm_zone_t *nonce_zone;       /* shared zone for the memory backend */
+    ngx_shm_zone_t *failure_zone;     /* shared zone for the adaptive throttle,
+                                          NULL = throttling disabled          */
+    ngx_uint_t   failure_limit;       /* failures within the window to ban   */
+    time_t       failure_window;      /* sliding window, seconds             */
+    time_t       failure_ban_time;    /* ban duration, seconds               */
+    size_t       failure_zone_size;   /* size of the throttle shared zone    */
     size_t       nonce_zone_size;     /* size of that shared zone           */
     ngx_str_t    nonce_addr;          /* redis host:port                    */
     ngx_str_t    nonce_password;      /* redis AUTH password (optional)     */
+    ngx_str_t    nonce_password_file; /* load AUTH password from a file     */
     ngx_flag_t   nonce_tls;           /* reach redis over TLS               */
     ngx_flag_t   nonce_tls_verify;    /* verify the redis certificate       */
     ngx_str_t    nonce_tls_ca;        /* CA bundle (empty = system store)   */
@@ -74,6 +85,9 @@ typedef struct {
     ngx_str_t    gpg_path;            /* absolute path to the gpg binary    */
     ngx_str_t    secret_file;
     ngx_str_t    secret;              /* loaded HMAC secret bytes           */
+    ngx_str_t    secret_previous_file; /* optional: still-accepted old secret */
+    ngx_str_t    secret_previous;
+    ngx_flag_t   disable_core_dumps;  /* setrlimit(RLIMIT_CORE, 0) at load  */
     ngx_str_t    thread_pool_name;    /* gpg thread pool ("off" = sync)     */
 #if (NGX_THREADS)
     ngx_thread_pool_t *thread_pool;   /* resolved pool, or NULL for sync    */
@@ -188,6 +202,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       offsetof(ngx_http_pgp_auth_loc_conf_t, secret_file),
       NULL },
 
+    { ngx_string("pgp_session_secret_previous"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, secret_previous_file),
+      NULL },
+
     { ngx_string("pgp_session_cookie_secure"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -223,6 +244,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       offsetof(ngx_http_pgp_auth_loc_conf_t, bind_ua),
       NULL },
 
+    { ngx_string("pgp_disable_core_dumps"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, disable_core_dumps),
+      NULL },
+
     { ngx_string("pgp_auth_nonce_storage"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_enum_slot,
@@ -244,11 +272,46 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_zone_size),
       NULL },
 
+    { ngx_string("pgp_auth_failure_limit"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, failure_limit),
+      NULL },
+
+    { ngx_string("pgp_auth_failure_window"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, failure_window),
+      NULL },
+
+    { ngx_string("pgp_auth_failure_ban_time"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, failure_ban_time),
+      NULL },
+
+    { ngx_string("pgp_auth_failure_zone_size"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, failure_zone_size),
+      NULL },
+
     { ngx_string("pgp_auth_nonce_storage_password"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_password),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_password_file"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_password_file),
       NULL },
 
     { ngx_string("pgp_auth_nonce_storage_tls"),
@@ -711,7 +774,35 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
     }
 
     if (!ngx_http_pgp_ct_eq(&mac_have, &mac_want)) {
-        return NGX_DECLINED;
+        /*
+         * Rotation: retry against the previous secret before rejecting, so a
+         * session cookie issued just before a pgp_session_secret rotation
+         * isn't immediately logged out. Only ever used to ACCEPT here -- new
+         * sessions are always signed with the current secret (ngx_http_pgp_grant
+         * uses ngx_http_pgp_hmac_hex, which is always plcf->secret).
+         */
+        ngx_int_t  matched_previous = 0;
+
+        if (plcf->secret_previous.len) {
+            ngx_str_t  ip, ua;
+            u_char     mac_bytes[64];
+
+            ngx_http_pgp_binding(r, plcf, &ip, &ua);
+            if (ngx_http_pgp_hmac_raw(&plcf->secret_previous, "sess", &ip, &ua,
+                                      payload.data, payload.len, mac_bytes)
+                == NGX_OK)
+            {
+                ngx_str_t  mac_want_prev;
+
+                mac_want_prev.data = mac_bytes;
+                mac_want_prev.len = sizeof(mac_bytes);
+                matched_previous = ngx_http_pgp_ct_eq(&mac_have, &mac_want_prev);
+            }
+        }
+
+        if (!matched_previous) {
+            return NGX_DECLINED;
+        }
     }
 
     exp = ngx_atotm(p, sep1 - p);
@@ -781,6 +872,33 @@ ngx_http_pgp_verify_pre(ngx_http_request_t *r, u_char *msg, size_t len)
  * thread-pool completion handler (async) -- see ngx_http_pgp_auth_submit.
  */
 /*
+ * Structured, single-line, greppable/parseable security event log, additive
+ * to (not a replacement for) the existing human-readable ngx_log_error calls.
+ * Intended for a SIEM or log pipeline to key off "pgp_auth_event:" and pick
+ * up result/reason/fpr/ip as plain key=value fields, without having to parse
+ * the free-form diagnostic messages that accompany each decision.
+ *
+ * MUST be called from the worker event loop only, never a thread -- exactly
+ * the same rule ngx_http_pgp_gpg_log_diag() follows (Pentest CCS F-003), and
+ * for the same reason: it touches r->connection->log directly. This is why
+ * validate_consume() (which can run on the verification thread) never calls
+ * this itself; it records a short reason via vr->chal_reason instead, and the
+ * worker-side caller (ngx_http_pgp_verify_post) is what actually logs.
+ */
+static void
+ngx_http_pgp_log_event(ngx_http_request_t *r, const char *result,
+    const char *reason, ngx_str_t *fpr)
+{
+    static ngx_str_t  dash = ngx_string("-");
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        "pgp_auth_event: result=\"%s\" reason=\"%s\" fpr=\"%V\" ip=\"%V\"",
+        result, reason, (fpr != NULL && fpr->len) ? fpr : &dash,
+        &r->connection->addr_text);
+}
+
+
+/*
  * Validate the challenge inside the SIGNED plaintext (MAC + expiry) and consume
  * its single-use nonce. THREAD-SAFE: it reads only `vr`, the read-only loc conf
  * and the caller-supplied binding; it allocates nothing from the request pool,
@@ -810,6 +928,7 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
     if (p + 3 > last) {
         ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
                       "pgp_auth: no challenge inside the signed content");
+        vr->chal_reason = "no_challenge_in_plaintext";
         return NGX_DECLINED;
     }
 
@@ -823,15 +942,16 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
 
     /* split: v1 | exp | nonce | mac */
     s1 = ngx_strlchr(p, line_end, '|');                       /* after v1   */
-    if (s1 == NULL) { return NGX_DECLINED; }
+    if (s1 == NULL) { vr->chal_reason = "malformed_challenge"; return NGX_DECLINED; }
     s2 = ngx_strlchr(s1 + 1, line_end, '|');                  /* after exp  */
-    if (s2 == NULL) { return NGX_DECLINED; }
+    if (s2 == NULL) { vr->chal_reason = "malformed_challenge"; return NGX_DECLINED; }
     s3 = ngx_strlchr(s2 + 1, line_end, '|');                  /* after nonce*/
-    if (s3 == NULL) { return NGX_DECLINED; }
+    if (s3 == NULL) { vr->chal_reason = "malformed_challenge"; return NGX_DECLINED; }
 
     if (ngx_http_pgp_hmac_raw(&plcf->secret, "chal", ip, ua, p, s3 - p,
                               mac_bytes) != NGX_OK)
     {
+        vr->chal_reason = "hmac_computation_failed";
         return NGX_ERROR;
     }
     mac_want.data = mac_bytes;
@@ -840,15 +960,37 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
     mac_have.len = line_end - (s3 + 1);
 
     if (!ngx_http_pgp_ct_eq(&mac_have, &mac_want)) {
-        ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
-                      "pgp_auth: challenge MAC mismatch");
-        return NGX_DECLINED;
+        /*
+         * Rotation: a challenge signed while pgp_session_secret_previous was
+         * still the current secret won't match the (now-rotated) current
+         * one. Retry against the previous secret before giving up, so an
+         * in-flight challenge issued right before a rotation doesn't fail
+         * just because the operator rotated the secret in between. Only
+         * ever used to ACCEPT here -- new challenges are always signed with
+         * the current secret (see ngx_http_pgp_hmac_hex/send_challenge).
+         */
+        ngx_int_t  matched_previous = 0;
+
+        if (plcf->secret_previous.len
+            && ngx_http_pgp_hmac_raw(&plcf->secret_previous, "chal", ip, ua,
+                                     p, s3 - p, mac_bytes) == NGX_OK)
+        {
+            matched_previous = ngx_http_pgp_ct_eq(&mac_have, &mac_want);
+        }
+
+        if (!matched_previous) {
+            ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
+                          "pgp_auth: challenge MAC mismatch");
+            vr->chal_reason = "challenge_mac_mismatch";
+            return NGX_DECLINED;
+        }
     }
 
     exp = ngx_atotm(s1 + 1, s2 - (s1 + 1));
     if (exp == NGX_ERROR || exp < ngx_time()) {
         ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
                       "pgp_auth: challenge expired");
+        vr->chal_reason = "challenge_expired";
         return NGX_DECLINED;
     }
 
@@ -873,14 +1015,17 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
     if (rc == NGX_DECLINED) {
         ngx_http_pgp_defer_diag(vr, NGX_LOG_INFO,
                       "pgp_auth: challenge already used (replay)");
+        vr->chal_reason = "replay";
         return NGX_DECLINED;
     }
     if (rc != NGX_OK) {
         ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: nonce store error; rejecting");
+        vr->chal_reason = "nonce_store_error";
         return NGX_DECLINED;
     }
 
+    vr->chal_reason = "valid_signature";
     return NGX_OK;
 }
 
@@ -895,6 +1040,7 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
     if (!vr->valid) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: signature not from a keyring key");
+        ngx_http_pgp_log_event(r, "denied", "unknown_or_invalid_signature", NULL);
         return NGX_DECLINED;
     }
 
@@ -905,6 +1051,7 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
     if (ngx_http_pgp_is_revoked(r, plcf, &fpr)) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: signing key is revoked");
+        ngx_http_pgp_log_event(r, "denied", "revoked_key", &fpr);
         return NGX_DECLINED;
     }
 
@@ -920,11 +1067,22 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
         rc = ngx_http_pgp_validate_consume(vr, plcf, &ip, &ua);
     }
     if (rc != NGX_OK) {
+        /*
+         * vr->chal_reason was set by validate_consume -- possibly on the
+         * verification thread -- as a plain pointer-to-literal assignment,
+         * so reading it here on the worker is safe; only the logging call
+         * itself (which touches r->connection->log) is restricted to the
+         * worker, and this is the worker.
+         */
+        ngx_http_pgp_log_event(r, rc == NGX_ERROR ? "error" : "denied",
+                               vr->chal_reason ? vr->chal_reason : "unknown",
+                               &fpr);
         return rc;
     }
 
     fpr.data = vr->fpr;
     fpr.len = vr->fpr_len;
+    ngx_http_pgp_log_event(r, "granted", "valid_signature", &fpr);
     return ngx_http_pgp_grant(r, plcf, &fpr);
 }
 
@@ -938,6 +1096,10 @@ static void
 ngx_http_pgp_verify_finalize(ngx_http_request_t *r,
     ngx_http_pgp_auth_loc_conf_t *plcf, ngx_int_t rc)
 {
+    ngx_http_pgp_throttle_record(r, plcf->failure_zone,
+        rc == NGX_HTTP_SEE_OTHER, plcf->failure_limit, plcf->failure_window,
+        plcf->failure_ban_time);
+
     if (rc == NGX_HTTP_SEE_OTHER) {
         /*
          * Send the 303 ourselves (status + Set-Cookie + relative Location, no
@@ -1506,6 +1668,18 @@ ngx_http_pgp_auth_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
+    /*
+     * Adaptive per-IP throttle (opt-in, off unless pgp_auth_failure_limit is
+     * set): an IP that has been banned for repeated failed attempts is
+     * rejected here, before any challenge is even issued or any gpg work is
+     * done. This is deliberately separate from limit_req -- it only engages
+     * for a client that is actually failing verification, and clears on a
+     * successful login (see ngx_http_pgp_auth_throttle.c).
+     */
+    if (ngx_http_pgp_throttle_is_banned(r, plcf->failure_zone) != NGX_OK) {
+        return NGX_HTTP_TOO_MANY_REQUESTS;
+    }
+
     ngx_str_set(&arg, NGX_HTTP_PGP_AUTH_ARG);
 
     if (r->method == NGX_HTTP_POST
@@ -1565,15 +1739,45 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->cookie_samesite = NGX_CONF_UNSET_UINT;
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
+    conf->disable_core_dumps = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
     conf->nonce_tls = NGX_CONF_UNSET;
     conf->nonce_tls_verify = NGX_CONF_UNSET;
     conf->nonce_zone_size = NGX_CONF_UNSET_SIZE;
+    conf->failure_limit = NGX_CONF_UNSET_UINT;
+    conf->failure_window = NGX_CONF_UNSET;
+    conf->failure_ban_time = NGX_CONF_UNSET;
+    conf->failure_zone_size = NGX_CONF_UNSET_SIZE;
     conf->revoc_fail_open = NGX_CONF_UNSET;
     conf->gpg_timeout = NGX_CONF_UNSET_MSEC;
     conf->max_body_size = NGX_CONF_UNSET_SIZE;
 
     return conf;
+}
+
+
+/*
+ * Best-effort: lock a secret buffer into physical RAM so it can't be paged
+ * out to swap (where it could outlive the process on disk) and, on systems
+ * where mlock() also implies MADV_DONTDUMP-like exclusion or where the admin
+ * has configured core dumps to skip locked pages, reduces the chance it ends
+ * up readable in a crash dump. Failure (e.g. RLIMIT_MEMLOCK too low for an
+ * unprivileged worker) is logged once at NOTICE and otherwise ignored: this
+ * is defense in depth, not a correctness requirement.
+ */
+static void
+ngx_http_pgp_mlock_secret(ngx_conf_t *cf, ngx_str_t *secret)
+{
+    if (secret->len == 0) {
+        return;
+    }
+
+    if (mlock(secret->data, secret->len) != 0) {
+        ngx_conf_log_error(NGX_LOG_NOTICE, cf, ngx_errno,
+            "pgp_auth: mlock() on the secret buffer failed (continuing "
+            "without it); raise RLIMIT_MEMLOCK for the nginx user to enable "
+            "this hardening");
+    }
 }
 
 
@@ -1676,10 +1880,25 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               NGX_HTTP_PGP_SAMESITE_LAX);
     ngx_conf_merge_value(conf->bind_ip, prev->bind_ip, 1);
     ngx_conf_merge_value(conf->bind_ua, prev->bind_ua, 1);
+    /* on by default: a core dump is the one place the in-memory secret and a
+     * client's plaintext could both end up readable on disk at once */
+    ngx_conf_merge_value(conf->disable_core_dumps, prev->disable_core_dumps, 1);
     ngx_conf_merge_uint_value(conf->nonce_storage, prev->nonce_storage,
                               NGX_HTTP_PGP_NONCE_MEMORY);
     ngx_conf_merge_size_value(conf->nonce_zone_size, prev->nonce_zone_size,
                               NGX_HTTP_PGP_NONCE_ZONE_SIZE);
+    /*
+     * Off by default (limit 0): existing configs, and this module's own test
+     * suite, issue many deliberate failed attempts from the same source IP to
+     * exercise attack-case rejections -- turning this on unconditionally
+     * would risk banning that IP mid-suite. Opt in explicitly with
+     * pgp_auth_failure_limit > 0.
+     */
+    ngx_conf_merge_uint_value(conf->failure_limit, prev->failure_limit, 0);
+    ngx_conf_merge_sec_value(conf->failure_window, prev->failure_window, 60);
+    ngx_conf_merge_sec_value(conf->failure_ban_time, prev->failure_ban_time, 300);
+    ngx_conf_merge_size_value(conf->failure_zone_size, prev->failure_zone_size,
+                              NGX_HTTP_PGP_THROTTLE_ZONE_SIZE);
     ngx_conf_merge_str_value(conf->nonce_addr, prev->nonce_addr, "");
     ngx_conf_merge_value(conf->nonce_tls, prev->nonce_tls, 0);
     ngx_conf_merge_value(conf->nonce_tls_verify, prev->nonce_tls_verify, 1);
@@ -1703,6 +1922,27 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (!conf->enable) {
         return NGX_CONF_OK;
+    }
+
+    if (conf->disable_core_dumps) {
+        struct rlimit rl;
+
+        /*
+         * Runs in the master while parsing config, both on initial start and
+         * on every `nginx -s reload` -- before it forks the workers that will
+         * actually run this location, so the limit is in place for their
+         * whole lifetime via normal rlimit-across-fork inheritance. Calling
+         * this once per location that enables the module is harmless (it's
+         * just clamping an already-process-wide limit to 0 again).
+         */
+        rl.rlim_cur = 0;
+        rl.rlim_max = 0;
+        if (setrlimit(RLIMIT_CORE, &rl) != 0) {
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, ngx_errno,
+                "pgp_auth: setrlimit(RLIMIT_CORE, 0) failed (continuing "
+                "without it); set pgp_disable_core_dumps off to silence this "
+                "if core dumps are intentionally enabled for this worker");
+        }
     }
 
 #if (NGX_THREADS)
@@ -1801,17 +2041,58 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
-    /* inherit an already-loaded secret from the parent if possible */
+    if (conf->failure_limit > 0) {
+        conf->failure_zone = prev->failure_zone
+            ? prev->failure_zone
+            : ngx_http_pgp_throttle_add_zone(cf, conf->failure_zone_size);
+        if (conf->failure_zone == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    /*
+     * Redis AUTH password: file-based is preferred (keeps the password out of
+     * nginx -T output and config-in-git), same reasoning as pgp_session_secret.
+     * The two forms are mutually exclusive to avoid ambiguity about which one
+     * wins.
+     */
+    if (conf->nonce_password.len && conf->nonce_password_file.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "pgp_auth: set only one of pgp_auth_nonce_storage_password or "
+            "pgp_auth_nonce_storage_password_file, not both");
+        return NGX_CONF_ERROR;
+    }
+
+    if (conf->nonce_password_file.len) {
+        if (conf->nonce_password_file.len == prev->nonce_password_file.len
+            && prev->nonce_password.len
+            && ngx_strncmp(conf->nonce_password_file.data,
+                           prev->nonce_password_file.data,
+                           conf->nonce_password_file.len) == 0)
+        {
+            conf->nonce_password = prev->nonce_password;
+        } else {
+            if (ngx_conf_full_name(cf->cycle, &conf->nonce_password_file, 1)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+            if (ngx_http_pgp_load_secret(cf, &conf->nonce_password_file,
+                                         &conf->nonce_password) != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    /* inherit already-loaded secrets from the parent if possible */
     if (conf->secret_file.len == prev->secret_file.len
         && prev->secret.len
         && ngx_strncmp(conf->secret_file.data, prev->secret_file.data,
                        conf->secret_file.len) == 0)
     {
         conf->secret = prev->secret;
-        return NGX_CONF_OK;
-    }
-
-    if (conf->secret_file.len) {
+    } else if (conf->secret_file.len) {
         if (ngx_conf_full_name(cf->cycle, &conf->secret_file, 1) != NGX_OK) {
             return NGX_CONF_ERROR;
         }
@@ -1843,6 +2124,54 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             "secret (sessions reset on reload and are not shared across "
             "instances)");
     }
+
+    /*
+     * Optional previous secret, for rotation: during a rotation window, MACs
+     * are still ACCEPTED (verified) against this secret if they don't match
+     * the current one, but everything newly issued (sessions, challenges) is
+     * always signed with the current secret only. This lets already-issued
+     * sessions/challenges survive a secret change instead of every active
+     * user being logged out the instant pgp_session_secret is rotated.
+     */
+    if (conf->secret_previous_file.len == prev->secret_previous_file.len
+        && prev->secret_previous.len
+        && ngx_strncmp(conf->secret_previous_file.data,
+                       prev->secret_previous_file.data,
+                       conf->secret_previous_file.len) == 0)
+    {
+        conf->secret_previous = prev->secret_previous;
+    } else if (conf->secret_previous_file.len) {
+        if (ngx_conf_full_name(cf->cycle, &conf->secret_previous_file, 1)
+            != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+        if (ngx_http_pgp_load_secret(cf, &conf->secret_previous_file,
+                                     &conf->secret_previous) != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+        if (conf->secret_previous.len == conf->secret.len
+            && ngx_strncmp(conf->secret_previous.data, conf->secret.data,
+                           conf->secret.len) == 0)
+        {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                "pgp_auth: pgp_session_secret_previous is identical to "
+                "pgp_session_secret; it has no effect and can be removed "
+                "once the rotation window has passed");
+        }
+    }
+
+    /*
+     * Lock every secret-bearing buffer into physical memory so it can never
+     * be written to swap, and won't appear in a core dump written to disk
+     * after the fact (best-effort: mlock() can fail under a restrictive
+     * RLIMIT_MEMLOCK, which is logged but not fatal -- the process still
+     * works, just without this extra layer).
+     */
+    ngx_http_pgp_mlock_secret(cf, &conf->secret);
+    ngx_http_pgp_mlock_secret(cf, &conf->secret_previous);
+    ngx_http_pgp_mlock_secret(cf, &conf->nonce_password);
 
     return NGX_CONF_OK;
 }

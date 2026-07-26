@@ -68,6 +68,13 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_gpg_timeout` | `2s` | Max time for one gpg verification before it is killed. |
 | `pgp_gpg_thread_pool` | `default` | Name of the nginx `thread_pool` that gpg verification runs on, so the worker never blocks while `gpg` runs (see [SECURITY.md](SECURITY.md)). The `default` pool is auto-created if you don't declare one. Set `off` to force synchronous verification. On an nginx built without `--with-threads`, this is accepted and ignored — verification is synchronous. |
 | `pgp_auth_max_body_size` | `16k` | Reject a login body larger than this before reading it or spawning gpg. |
+| `pgp_session_secret_previous` | — | Optional second secret file, for zero-downtime rotation of `pgp_session_secret`. Sessions and challenges are still **accepted** if their MAC matches this secret, but everything newly issued is signed with the current secret only. Set it to the old secret during a rotation window, then remove it once outstanding sessions/challenges have expired. |
+| `pgp_auth_nonce_storage_password_file` | — | Load the Redis `AUTH` password from a file instead of inline (`pgp_auth_nonce_storage_password`), so it never appears in `nginx -T` output or a committed config. Mutually exclusive with the inline form. |
+| `pgp_disable_core_dumps` | `on` | Disable core dumps for worker processes (`setrlimit(RLIMIT_CORE, 0)` in the master before fork), so the in-memory secret and a client's decrypted plaintext can't be written to a core file. Set `off` if you deliberately need core dumps for debugging. |
+| `pgp_auth_failure_limit` | `0` (off) | Adaptive per-IP failure throttle: after this many failed verifications from one IP within `pgp_auth_failure_window`, that IP is banned (`429`) for `pgp_auth_failure_ban_time`; a successful login clears its counter. `0` disables it. A layer on top of `limit_req`, not a replacement. |
+| `pgp_auth_failure_window` | `60s` | Sliding window over which failed attempts are counted for the throttle. |
+| `pgp_auth_failure_ban_time` | `300s` | How long a banned IP stays blocked. |
+| `pgp_auth_failure_zone_size` | `1m` | Shared-memory zone for the failure throttle. Fails open (degrades to `limit_req` only) if full, since it's a best-effort extra layer. |
 
 All directives are valid at `http`, `server`, and `location` scope.
 
