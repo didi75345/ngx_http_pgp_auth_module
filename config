@@ -2,7 +2,8 @@ ngx_addon_name=ngx_http_pgp_auth_module
 
 PGP_AUTH_SRCS="$ngx_addon_dir/src/ngx_http_pgp_auth_module.c \
                $ngx_addon_dir/src/ngx_http_pgp_auth_gpg.c \
-               $ngx_addon_dir/src/ngx_http_pgp_auth_nonce.c"
+               $ngx_addon_dir/src/ngx_http_pgp_auth_nonce.c \
+               $ngx_addon_dir/src/ngx_http_pgp_auth_throttle.c"
 
 if test -n "$ngx_module_link"; then
     # nginx >= 1.9.11: dynamic-module aware build

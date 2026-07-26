@@ -58,6 +58,9 @@ gpg --batch --gen-key "$WORK/kp2" >/dev/null 2>&1
 export GNUPGHOME="$WORK/gpg"
 
 head -c 48 /dev/urandom | base64 > "$WORK/session.key"; chmod 600 "$WORK/session.key"
+# two independent secrets for the session-secret rotation test
+head -c 48 /dev/urandom | base64 > "$WORK/rot_old.key"; chmod 600 "$WORK/rot_old.key"
+head -c 48 /dev/urandom | base64 > "$WORK/rot_new.key"; chmod 600 "$WORK/rot_new.key"
 echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 
 # revocation list containing the test key's fingerprint (for the /revoc/ test)
@@ -120,6 +123,24 @@ http {
             pgp_session_timeout 24h;
             root $WORK/html;
             index index.html;
+        }
+        # --- session-secret rotation: mint under old, accept during window,
+        #     reject once the previous-secret directive is gone ---
+        location /rot-mint/ {
+            pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/rot_old.key;
+            pgp_auth_nonce_storage none; root $WORK/html;
+        }
+        location /rot-window/ {
+            pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/rot_new.key;
+            pgp_session_secret_previous $WORK/rot_old.key;
+            pgp_auth_nonce_storage none; root $WORK/html;
+        }
+        location /rot-done/ {
+            pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/rot_new.key;
+            pgp_auth_nonce_storage none; root $WORK/html;
         }
         location /short/ {
             pgp_auth on;
@@ -718,6 +739,32 @@ EOF
 else
     echo "  SKIP  redis backend + AUTH tests (redis-server not installed)"
 fi
+
+# --- session-secret rotation (closes the gap noted in the addendum) ----------
+# Mint a session under the OLD secret, then present it to a location whose
+# CURRENT secret is the new one but which still lists the old one as
+# pgp_session_secret_previous: it must still be accepted. Present the same
+# cookie to a location that has rotated fully (no previous): it must be
+# rejected. Also implicitly checks that the previous-secret retry
+# (ngx_http_pgp_hmac_raw) matches a cookie minted the normal way.
+curl -s "$base/rot-mint/" -o "$WORK/rmp" >/dev/null
+RMCH="$(challenge "$WORK/rmp")"
+printf '%s' "$RMCH" | gpg --clearsign --batch > "$WORK/rm.asc" 2>/dev/null
+ROTCK=$(curl -s -o /dev/null -D - -X POST "$base/rot-mint/?__pgp_auth=1" \
+        --data-urlencode "signed@$WORK/rm.asc" \
+        | grep -i '^set-cookie:' | sed 's/^[Ss]et-[Cc]ookie:[ ]*//; s/;.*//' | tr -d '\r')
+# Success signal = the request got PAST auth (so it does NOT get the challenge
+# page, whose form posts to ?__pgp_auth=1). The rot-* locations have no file at
+# their sub-path, so an authenticated request yields 404 rather than SECRET-OK;
+# what matters is that it is not re-challenged.
+curl -s -H "Cookie: $ROTCK" "$base/rot-window/" -o "$WORK/rw" >/dev/null
+grep -q '__pgp_auth' "$WORK/rw" \
+    && bad "rotation: old-secret session not accepted during the window (re-challenged)" \
+    || ok "rotation: session under the old secret is still granted during the window"
+curl -s -H "Cookie: $ROTCK" "$base/rot-done/" -o "$WORK/rd" >/dev/null
+grep -q '__pgp_auth' "$WORK/rd" \
+    && ok "rotation: old-secret session is rejected once the previous secret is removed" \
+    || bad "rotation: old-secret session still accepted after the previous secret was removed"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

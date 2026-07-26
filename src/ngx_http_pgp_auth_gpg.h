@@ -46,6 +46,16 @@ typedef struct {
      */
     ngx_uint_t chal_done;           /* 1 = the thread already validated+consumed */
     ngx_int_t  chal_rc;             /* NGX_OK / NGX_DECLINED / NGX_ERROR */
+
+    /*
+     * Short, static-string reason code for the structured pgp_auth_event log
+     * line (see ngx_http_pgp_log_event() in the module). Set alongside
+     * ngx_http_pgp_defer_diag()/ngx_http_pgp_gpg_diag() at the same decision
+     * points; a plain pointer assignment to a string literal, so it's just as
+     * thread-safe to set from the verification thread as the diag mechanism
+     * it travels with. NULL if nothing decided yet.
+     */
+    const char *chal_reason;
 } ngx_http_pgp_verify_result_t;
 
 /*

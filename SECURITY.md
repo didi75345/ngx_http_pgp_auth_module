@@ -163,6 +163,45 @@ Everything else (the keyring, the secret) is operator-controlled.
   secret is a full bypass. `$TMPDIR` is honoured for the throwaway keyring dir,
   matching the documented "system temp dir".
 
+## Additional hardening (proactive)
+
+These are defense-in-depth layers and operational capabilities added beyond the
+review findings; none fixes a known vulnerability, they reduce blast radius and
+close operational gaps.
+
+- **Secret rotation without mass logout** (`pgp_session_secret_previous`). A
+  second secret can be accepted during a rotation window: verification tries the
+  current secret first and the previous one only on a miss, while *signing*
+  always uses the current secret. Already-issued sessions and challenges survive
+  a `pgp_session_secret` change instead of every user being logged out at once;
+  removing the directive after the window cleanly retires the old material. The
+  retry uses the same constant-time comparison and can only ever *accept*, never
+  weaken issuance.
+- **Secrets locked into RAM** (`mlock`). The session secret, the previous
+  secret, and the Redis password are `mlock()`ed after loading so the kernel
+  can't page them to swap, where they could outlive the process on disk.
+  Best-effort: if `RLIMIT_MEMLOCK` is too low it logs a notice and continues.
+- **Core dumps disabled by default** (`pgp_disable_core_dumps on`). A core dump
+  is the one place the in-memory secret and a client's decrypted plaintext could
+  both land on disk together; the module sets `RLIMIT_CORE` to 0 in the master
+  before it forks workers, so this holds for every worker without relying on the
+  operator's system configuration.
+- **File-based Redis credentials** (`pgp_auth_nonce_storage_password_file`).
+  The Redis `AUTH` password can be loaded from a file, like `pgp_session_secret`,
+  so it never appears in `nginx -T` output or a committed config.
+- **Structured security-event log.** Alongside the existing human-readable
+  diagnostics, each decision emits one `pgp_auth_event: result="..."
+  reason="..." fpr="..." ip="..."` line in a fixed, greppable shape for a SIEM
+  pipeline. Emitted only from the worker (never the verification thread), so it
+  is thread-safe on the async path.
+- **Adaptive per-IP failure throttle** (`pgp_auth_failure_limit`, off by
+  default). Catches a slow, patient credential-probing pattern that stays under
+  a uniform `limit_req` — it bans an IP after repeated *failed* verifications and
+  clears it the moment that IP succeeds. It runs before any gpg work, mirrors the
+  already-reviewed nonce-store shared-memory design, and fails open (degrades to
+  `limit_req` alone) if its zone is full, since it is an extra layer rather than
+  the primary control.
+
 ## Login endpoint: cost, thread pool, and `limit_req`
 
 Verifying a signature means forking `gpg` and waiting for it. By default that
