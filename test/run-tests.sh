@@ -16,8 +16,18 @@ PASS=0
 FAIL=0
 
 cleanup() {
-    [ -f "$WORK/logs/nginx.pid" ] && kill "$(cat "$WORK/logs/nginx.pid")" 2>/dev/null || true
-    rm -rf "$WORK"
+    rc=$?
+    # Stop every nginx we may have started, then wait for them to actually exit
+    # before removing the work tree. Without the wait, a worker still flushing a
+    # log file races `rm -rf` and it fails with "Directory not empty", whose
+    # non-zero status would then fail the whole run even though the tests passed.
+    for _pf in nginx redis-nginx; do
+        [ -f "$WORK/logs/$_pf.pid" ] \
+            && kill "$(cat "$WORK/logs/$_pf.pid")" 2>/dev/null
+    done
+    wait 2>/dev/null || true
+    rm -rf "$WORK" 2>/dev/null || true
+    exit "$rc"
 }
 trap cleanup EXIT
 
