@@ -436,6 +436,12 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
      * and reject the signature outright if gpg reported it revoked, made by an
      * expired key, or itself expired/bad.
      *   [GNUPG:] VALIDSIG <primary-key-fpr> <date> <timestamp> ...
+     *
+     * FUZZ MIRROR: this status-line parse (including the VALIDSIG last-field
+     * fingerprint extraction) is reproduced by
+     * test/fuzz/fuzz_gpg_status_parser.c (ngx_pgp_fuzz_parse_status). Keep the
+     * two in sync -- a change here that isn't mirrored there silently stops the
+     * fuzzer from covering this code.
      */
     good = 0;
     bad = 0;
