@@ -2095,16 +2095,26 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
-    if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_MEMORY) {
+    /*
+     * The shared-memory nonce zone is created for BOTH the memory backend and
+     * the redis backend. For redis it is a per-node fallback: single-use is
+     * still enforced (per node) if Redis becomes unreachable, so a captured
+     * token can't be replayed during a Redis outage or once it recovers. See
+     * ngx_http_pgp_nonce_check_and_set().
+     */
+    if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_MEMORY
+        || conf->nonce_storage == NGX_HTTP_PGP_NONCE_REDIS)
+    {
         conf->nonce_zone = prev->nonce_zone
             ? prev->nonce_zone
             : ngx_http_pgp_nonce_add_zone(cf, conf->nonce_zone_size);
         if (conf->nonce_zone == NULL) {
             return NGX_CONF_ERROR;
         }
+    }
 
-    } else if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_REDIS
-               && conf->nonce_addr.len == 0)
+    if (conf->nonce_storage == NGX_HTTP_PGP_NONCE_REDIS
+        && conf->nonce_addr.len == 0)
     {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "pgp_auth: pgp_auth_nonce_storage_address is required for redis");

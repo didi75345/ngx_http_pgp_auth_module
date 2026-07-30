@@ -409,6 +409,23 @@ operator should do about them.
   concurrent logins, or use the `redis` backend where single-use must hold
   across nodes and under sustained load.
 
+- **The `redis` backend survives a Redis outage without failing open.** Redis
+  gives fleet-wide single-use, but the module also keeps a per-node
+  shared-memory store (the same one the `memory` backend uses) and records every
+  nonce in both. If Redis becomes **unreachable** (connection refused, timeout,
+  network partition), the module falls back to that local store: a fresh login
+  still works, but a replay of a nonce this node has already seen is rejected —
+  so a captured token cannot be replayed during the outage, nor after Redis
+  recovers (it was recorded locally the first time). The fallback covers only a
+  genuine *unreachable* Redis; a Redis that is reachable but rejects the request
+  (a wrong `AUTH` password, a TLS or protocol error, an error reply) still fails
+  closed, because falling back there would let a tampered or misconfigured
+  connection bypass the cross-node check. The residual limit is multi-node
+  during an outage: node A doesn't see node B's locally-recorded nonces until
+  Redis is back, so a captured token could be replayed once *on a different
+  node* during the outage window — narrower than the previous behaviour and
+  bounded by `pgp_challenge_timeout`.
+
 - **`pgp_revocation_fail_open on` weakens revocation by design.** With it set, an
   unreadable revocation list admits keys instead of denying them. The module
   warns about this at start-up. Leave it off unless you have a specific
