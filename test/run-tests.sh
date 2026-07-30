@@ -240,6 +240,17 @@ http {
             pgp_challenge_timeout 5s;
             root $WORK/html;
         }
+        location /redisdown/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            # redis backend pointed at a dead port == a Redis outage. Single-use
+            # must still hold via the per-node shared-memory fallback: a fresh
+            # login works, a replay of the same nonce is rejected.
+            pgp_auth_nonce_storage redis;
+            pgp_auth_nonce_storage_address 127.0.0.1:6399;
+            root $WORK/html;
+        }
         location /badgpgpath/ {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
@@ -666,6 +677,24 @@ curl -s -X POST "$base/clamp/?__pgp_auth=1" --data-urlencode "signed@$WORK/cl.as
 grep -qi '^set-cookie:' "$WORK/hcl" \
     && ok "out-of-bounds pgp_gpg_timeout is clamped (login still works)" \
     || bad "timeout clamp (login failed -- 1ms not clamped?)"
+
+# Redis fail-open replay (finding 002): /redisdown/ uses the redis backend
+# pointed at a dead port -- a Redis outage. Single-use must survive it via the
+# per-node shared-memory fallback: a FRESH login still works (availability), but
+# a REPLAY of the same nonce is rejected (so a captured token can't be replayed
+# during an outage, nor after Redis recovers, since it was recorded locally).
+curl -s "$base/redisdown/" -o "$WORK/rdA" >/dev/null
+RDCH="$(challenge "$WORK/rdA")"
+printf '%s' "$RDCH" | gpg --clearsign --batch > "$WORK/rd.asc" 2>/dev/null
+curl -s -X POST "$base/redisdown/?__pgp_auth=1" --data-urlencode "signed@$WORK/rd.asc" \
+     -D "$WORK/hrd1" -o /dev/null >/dev/null
+curl -s -X POST "$base/redisdown/?__pgp_auth=1" --data-urlencode "signed@$WORK/rd.asc" \
+     -D "$WORK/hrd2" -o /dev/null >/dev/null
+if grep -qi '^set-cookie:' "$WORK/hrd1" && ! grep -qi '^set-cookie:' "$WORK/hrd2"; then
+    ok "redis outage: fresh login works, replay blocked by local fallback"
+else
+    bad "redis-outage single-use fallback (1st should grant, replay should deny)"
+fi
 
 # pgp_gpg_path pointing at a nonexistent binary: must fail *safely* (login
 # rejected, no crash, no 500) rather than falling back to a $PATH search.
