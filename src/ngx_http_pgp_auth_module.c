@@ -88,6 +88,7 @@ typedef struct {
     ngx_str_t    secret_previous_file; /* optional: still-accepted old secret */
     ngx_str_t    secret_previous;
     ngx_flag_t   disable_core_dumps;  /* setrlimit(RLIMIT_CORE, 0) at load  */
+    ngx_flag_t   mlock_required;      /* fail to start if mlock() fails      */
     ngx_str_t    thread_pool_name;    /* gpg thread pool ("off" = sync)     */
 #if (NGX_THREADS)
     ngx_thread_pool_t *thread_pool;   /* resolved pool, or NULL for sync    */
@@ -249,6 +250,13 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, disable_core_dumps),
+      NULL },
+
+    { ngx_string("pgp_mlock_required"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, mlock_required),
       NULL },
 
     { ngx_string("pgp_auth_nonce_storage"),
@@ -448,11 +456,17 @@ ngx_http_pgp_hmac_raw(ngx_str_t *secret, const char *kind, ngx_str_t *ip,
     unsigned int   mdlen;
     unsigned char  md[EVP_MAX_MD_SIZE];
     u_char         sep = 0x1e;
-    HMAC_CTX      *ctx;
+    ngx_int_t      rc = NGX_ERROR;
+    /*
+     * Initialised to NULL and freed once via a single cleanup label, so that
+     * any future error path added between here and the end can `goto done`
+     * without risking a double free (HMAC_CTX_free(NULL) is a safe no-op).
+     */
+    HMAC_CTX      *ctx = NULL;
 
     ctx = HMAC_CTX_new();
     if (ctx == NULL) {
-        return NGX_ERROR;
+        goto done;
     }
 
     if (HMAC_Init_ex(ctx, secret->data, (int) secret->len, EVP_sha256(), NULL)
@@ -466,13 +480,18 @@ ngx_http_pgp_hmac_raw(ngx_str_t *secret, const char *kind, ngx_str_t *ip,
         || HMAC_Update(ctx, ua->data, ua->len) != 1
         || HMAC_Final(ctx, md, &mdlen) != 1)
     {
-        HMAC_CTX_free(ctx);
-        return NGX_ERROR;
+        goto done;
     }
 
-    HMAC_CTX_free(ctx);
     ngx_hex_dump(out64, md, mdlen);
-    return NGX_OK;
+    rc = NGX_OK;
+
+done:
+
+    if (ctx != NULL) {
+        HMAC_CTX_free(ctx);
+    }
+    return rc;
 }
 
 
@@ -1405,6 +1424,11 @@ ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body, size_t max)
  * Decode the "signed=..." field from an application/x-www-form-urlencoded
  * body in place. '+' becomes space, %XX becomes its byte. Returns the
  * decoded value through `out`.
+ *
+ * FUZZ MIRROR: the byte-scanning loop below is reproduced by
+ * test/fuzz/fuzz_form_field_decoder.c (decode_field). If you change the
+ * decoding here, update that mirror too or the fuzzer stops exercising this
+ * code path.
  */
 static ngx_int_t
 ngx_http_pgp_form_field(ngx_str_t *body, ngx_str_t *out)
@@ -1740,6 +1764,7 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->bind_ip = NGX_CONF_UNSET;
     conf->bind_ua = NGX_CONF_UNSET;
     conf->disable_core_dumps = NGX_CONF_UNSET;
+    conf->mlock_required = NGX_CONF_UNSET;
     conf->nonce_storage = NGX_CONF_UNSET_UINT;
     conf->nonce_tls = NGX_CONF_UNSET;
     conf->nonce_tls_verify = NGX_CONF_UNSET;
@@ -1762,22 +1787,31 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
  * where mlock() also implies MADV_DONTDUMP-like exclusion or where the admin
  * has configured core dumps to skip locked pages, reduces the chance it ends
  * up readable in a crash dump. Failure (e.g. RLIMIT_MEMLOCK too low for an
- * unprivileged worker) is logged once at NOTICE and otherwise ignored: this
- * is defense in depth, not a correctness requirement.
+ * unprivileged worker) is logged at ERR so it isn't lost in the noise. It is
+ * only fatal when pgp_mlock_required is on: an operator who is relying on this
+ * hardening can then choose to have nginx refuse to start rather than run
+ * silently without swap protection. Returns NGX_OK unless mlock failed and
+ * `required` is set.
  */
-static void
-ngx_http_pgp_mlock_secret(ngx_conf_t *cf, ngx_str_t *secret)
+static ngx_int_t
+ngx_http_pgp_mlock_secret(ngx_conf_t *cf, ngx_str_t *secret, ngx_flag_t required)
 {
     if (secret->len == 0) {
-        return;
+        return NGX_OK;
     }
 
     if (mlock(secret->data, secret->len) != 0) {
-        ngx_conf_log_error(NGX_LOG_NOTICE, cf, ngx_errno,
-            "pgp_auth: mlock() on the secret buffer failed (continuing "
-            "without it); raise RLIMIT_MEMLOCK for the nginx user to enable "
-            "this hardening");
+        ngx_conf_log_error(required ? NGX_LOG_EMERG : NGX_LOG_ERR, cf, ngx_errno,
+            "pgp_auth: mlock() on the secret buffer failed%s; raise "
+            "RLIMIT_MEMLOCK for the nginx user to enable this hardening%s",
+            required ? "" : " (continuing without it)",
+            required ? ", or set pgp_mlock_required off" : "");
+        if (required) {
+            return NGX_ERROR;
+        }
     }
+
+    return NGX_OK;
 }
 
 
@@ -1872,6 +1906,24 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * remain fully configurable. */
     ngx_conf_merge_sec_value(conf->challenge_timeout, prev->challenge_timeout,
                              120);
+    /*
+     * Guard against a typo turning off a protection. A sub-second challenge is
+     * unusable (nobody can sign and paste in time), and a multi-day one widens
+     * the replay window pointlessly. Clamp to a sane band and tell the operator.
+     * The 5s floor (rather than a larger one) still leaves room for a
+     * deliberately short replay window in high-security setups.
+     */
+    if (conf->challenge_timeout < 5) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+            "pgp_auth: pgp_challenge_timeout %Ts is below the 5s minimum; "
+            "clamping to 5s", conf->challenge_timeout);
+        conf->challenge_timeout = 5;
+    } else if (conf->challenge_timeout > 3600) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+            "pgp_auth: pgp_challenge_timeout %Ts is above the 3600s maximum; "
+            "clamping to 3600s", conf->challenge_timeout);
+        conf->challenge_timeout = 3600;
+    }
     ngx_conf_merge_sec_value(conf->session_timeout, prev->session_timeout,
                              3600);
     ngx_conf_merge_value(conf->cookie_secure, prev->cookie_secure, 1);
@@ -1883,6 +1935,7 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* on by default: a core dump is the one place the in-memory secret and a
      * client's plaintext could both end up readable on disk at once */
     ngx_conf_merge_value(conf->disable_core_dumps, prev->disable_core_dumps, 1);
+    ngx_conf_merge_value(conf->mlock_required, prev->mlock_required, 0);
     ngx_conf_merge_uint_value(conf->nonce_storage, prev->nonce_storage,
                               NGX_HTTP_PGP_NONCE_MEMORY);
     ngx_conf_merge_size_value(conf->nonce_zone_size, prev->nonce_zone_size,
@@ -1909,6 +1962,23 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* revocation fails CLOSED by default: an unreadable list denies access */
     ngx_conf_merge_value(conf->revoc_fail_open, prev->revoc_fail_open, 0);
     ngx_conf_merge_msec_value(conf->gpg_timeout, prev->gpg_timeout, 2000);
+    /*
+     * A gpg timeout of a few milliseconds would time out every real
+     * verification (so nobody could ever log in); a very large one would
+     * negate the timeout entirely (a stuck gpg could pin a thread/worker for
+     * minutes). Clamp to [1s, 60s].
+     */
+    if (conf->gpg_timeout < 1000) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+            "pgp_auth: pgp_gpg_timeout %Mms is below the 1s minimum; "
+            "clamping to 1s", conf->gpg_timeout);
+        conf->gpg_timeout = 1000;
+    } else if (conf->gpg_timeout > 60000) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+            "pgp_auth: pgp_gpg_timeout %Mms is above the 60s maximum; "
+            "clamping to 60s", conf->gpg_timeout);
+        conf->gpg_timeout = 60000;
+    }
     ngx_conf_merge_size_value(conf->max_body_size, prev->max_body_size, 16384);
     ngx_conf_merge_str_value(conf->secret_file, prev->secret_file, "");
     /*
@@ -2169,9 +2239,15 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * RLIMIT_MEMLOCK, which is logged but not fatal -- the process still
      * works, just without this extra layer).
      */
-    ngx_http_pgp_mlock_secret(cf, &conf->secret);
-    ngx_http_pgp_mlock_secret(cf, &conf->secret_previous);
-    ngx_http_pgp_mlock_secret(cf, &conf->nonce_password);
+    if (ngx_http_pgp_mlock_secret(cf, &conf->secret, conf->mlock_required)
+            != NGX_OK
+        || ngx_http_pgp_mlock_secret(cf, &conf->secret_previous,
+                                     conf->mlock_required) != NGX_OK
+        || ngx_http_pgp_mlock_secret(cf, &conf->nonce_password,
+                                     conf->mlock_required) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }

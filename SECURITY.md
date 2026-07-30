@@ -414,6 +414,31 @@ operator should do about them.
   warns about this at start-up. Leave it off unless you have a specific
   availability reason.
 
+- **Shared-memory state is not time-adjusted across a reload.** Both the
+  single-use nonce store and the failure throttle keep their entries in a
+  shared-memory zone that survives an `nginx -s reload` (the zone is reused, not
+  re-created). Their timestamps are wall-clock and are not rebased on reload, so
+  immediately after a reload existing entries are compared against the current
+  time as usual — which means a client currently inside a throttle ban can end
+  it early by causing (or waiting for) a reload, since the ban's expiry is a
+  fixed wall-clock time and a reload doesn't extend it. The window is small in
+  practice (throttle windows are seconds-to-minutes and reloads are infrequent),
+  and the throttle is a defence-in-depth layer on top of `limit_req`, not the
+  primary control. If ban persistence across reloads is operationally important,
+  pair the module with an external throttle such as **fail2ban**, which keeps its
+  own state.
+
+- **The login page's CSP allows inline styles.** The challenge page is a small
+  self-contained HTML document with an inline `<style>` block, so its
+  `Content-Security-Policy` uses `style-src 'unsafe-inline'`. This permits inline
+  *style* injection but not script injection (`script-src` is not relaxed), and
+  the page's markup is module-generated, not attacker-influenced. Eliminating
+  `unsafe-inline` would mean serving the CSS as a separate static file, which
+  would break the module's self-contained design (it ships no static assets and
+  needs no `location` to serve them). This is a deliberate, accepted trade-off:
+  a slightly weaker style-src on one internal login page, in exchange for a
+  module that drops in with no companion files.
+
 ## Verification
 
 The module compiles with `-Wall -Werror` (zero warnings) on Debian Bookworm

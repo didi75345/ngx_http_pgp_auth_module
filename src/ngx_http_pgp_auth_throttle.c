@@ -109,13 +109,24 @@ ngx_http_pgp_throttle_lookup(ngx_http_pgp_throttle_sh_t *sh, uint32_t hash,
 
 
 /* Evict up to `max` of the oldest entries that are both unbanned and outside
- * their counting window -- i.e. truly stale, not just currently-clean. */
+ * their counting window -- i.e. truly stale, not just currently-clean.
+ *
+ * The stale threshold is tied to the configured failure_window rather than a
+ * fixed hour: an entry is reclaimable once its window is well past. We keep a
+ * one-hour floor so that with short windows entries aren't churned in and out
+ * on every request, and scale up with the window so a long window (e.g. a
+ * day-long tracking window) doesn't have its entries evicted an hour after the
+ * window ends -- which would drop ban/counting state the operator asked to
+ * keep. `window` is the caller's failure_window (0 = throttle disabled). */
 static void
 ngx_http_pgp_throttle_evict_stale(ngx_http_pgp_throttle_ctx_t *ctx, time_t now,
-    ngx_uint_t max)
+    time_t window, ngx_uint_t max)
 {
+    time_t                         stale_after;
     ngx_queue_t                   *q, *prev;
     ngx_http_pgp_throttle_node_t  *n;
+
+    stale_after = ngx_max(window, 3600);
 
     q = ngx_queue_empty(&ctx->sh->queue) ? NULL : ngx_queue_last(&ctx->sh->queue);
 
@@ -123,7 +134,7 @@ ngx_http_pgp_throttle_evict_stale(ngx_http_pgp_throttle_ctx_t *ctx, time_t now,
         n = ngx_queue_data(q, ngx_http_pgp_throttle_node_t, queue);
         prev = ngx_queue_prev(q);
 
-        if (n->banned_until <= now && n->window_start + 3600 <= now) {
+        if (n->banned_until <= now && n->window_start + stale_after <= now) {
             ngx_queue_remove(q);
             ngx_rbtree_delete(&ctx->sh->rbtree, &n->node);
             ngx_slab_free_locked(ctx->shpool, n);
@@ -223,12 +234,12 @@ ngx_http_pgp_throttle_record(ngx_http_request_t *r, ngx_shm_zone_t *zone,
     }
 
     if (n == NULL) {
-        ngx_http_pgp_throttle_evict_stale(ctx, now, 8);
+        ngx_http_pgp_throttle_evict_stale(ctx, now, window, 8);
 
         size = offsetof(ngx_http_pgp_throttle_node_t, data) + ip.len;
         n = ngx_slab_alloc_locked(ctx->shpool, size);
         if (n == NULL) {
-            ngx_http_pgp_throttle_evict_stale(ctx, now, 512);
+            ngx_http_pgp_throttle_evict_stale(ctx, now, window, 512);
             n = ngx_slab_alloc_locked(ctx->shpool, size);
             if (n == NULL) {
                 /*

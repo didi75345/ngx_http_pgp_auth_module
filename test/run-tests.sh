@@ -156,7 +156,7 @@ http {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
-            pgp_challenge_timeout 1s;
+            pgp_challenge_timeout 5s;   # the clamp floor; expiry tested below
             root $WORK/html;
         }
         location /revoc/ {
@@ -226,6 +226,18 @@ http {
             pgp_session_secret $WORK/session.key;
             pgp_auth_nonce_storage none;
             pgp_gpg_thread_pool off;   # force synchronous verification
+            root $WORK/html;
+        }
+        location /clamp/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            # out-of-bounds values: must be clamped (gpg 1ms -> 1s, challenge
+            # 5s -> 30s), NOT applied literally. If gpg_timeout stayed at 1ms
+            # every verification would time out and login would fail.
+            pgp_gpg_timeout 1ms;
+            pgp_challenge_timeout 5s;
             root $WORK/html;
         }
         location /badgpgpath/ {
@@ -524,7 +536,7 @@ grep -qi '^set-cookie:' "$WORK/hj" && bad "non-PGP body rejected pre-fork" \
 curl -s "$base/short/" -o "$WORK/sp" >/dev/null
 CHS="$(challenge "$WORK/sp")"
 printf '%s' "$CHS" | gpg --clearsign --batch > "$WORK/se.asc" 2>/dev/null
-sleep 2
+sleep 6
 curl -s -X POST "$base/short/?__pgp_auth=1" --data-urlencode "signed@$WORK/se.asc" \
      -D "$WORK/h4" -o /dev/null >/dev/null
 grep -qi '^set-cookie:' "$WORK/h4" && bad "expired challenge rejected" \
@@ -642,6 +654,18 @@ curl -s -X POST "$base/syncpool/?__pgp_auth=1" --data-urlencode "signed@$WORK/sp
 grep -qi '^set-cookie:' "$WORK/hsp2" \
     && ok "pgp_gpg_thread_pool off: synchronous fallback login works" \
     || bad "pgp_gpg_thread_pool off login"
+
+# Timeout bounds: /clamp/ sets pgp_gpg_timeout 1ms (below the 1s floor). If it
+# were applied literally every verification would time out; because it's clamped
+# to 1s, a real login still succeeds.
+curl -s "$base/clamp/" -o "$WORK/clA" >/dev/null
+CLCH="$(challenge "$WORK/clA")"
+printf '%s' "$CLCH" | gpg --clearsign --batch > "$WORK/cl.asc" 2>/dev/null
+curl -s -X POST "$base/clamp/?__pgp_auth=1" --data-urlencode "signed@$WORK/cl.asc" \
+     -D "$WORK/hcl" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hcl" \
+    && ok "out-of-bounds pgp_gpg_timeout is clamped (login still works)" \
+    || bad "timeout clamp (login failed -- 1ms not clamped?)"
 
 # pgp_gpg_path pointing at a nonexistent binary: must fail *safely* (login
 # rejected, no crash, no 500) rather than falling back to a $PATH search.
