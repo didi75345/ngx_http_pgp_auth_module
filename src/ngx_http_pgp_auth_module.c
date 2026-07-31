@@ -26,6 +26,18 @@
 #include <ngx_http.h>
 #include <nginx.h>     /* nginx_version, for the cookie-API compatibility shim */
 
+/*
+ * The incremental HMAC_CTX API is marked deprecated in OpenSSL 3.0 (though
+ * still fully supported); with -Werror that would fail the build. nginx's own
+ * ngx_event_openssl.h defines this exact macro, so a build --with-http_ssl_module
+ * compiles, but the module must not depend on the SSL module being enabled to
+ * build. Define it ourselves, before any OpenSSL header, so the module compiles
+ * on OpenSSL 3.x regardless of nginx's configure flags.
+ */
+#ifndef OPENSSL_SUPPRESS_DEPRECATED
+#define OPENSSL_SUPPRESS_DEPRECATED
+#endif
+
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
