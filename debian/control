@@ -1,0 +1,37 @@
+Source: nginx-pgp-auth
+Section: httpd
+Priority: optional
+Maintainer: didi75345 <didi75345@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               nginx-dev,
+               libssl-dev,
+               libpcre2-dev,
+               zlib1g-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/didi75345/ngx_http_pgp_auth_module
+Rules-Requires-Root: no
+
+Package: libnginx-mod-http-pgp-auth
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         ${nginx:abi},
+         gnupg
+Recommends: redis-server
+Description: PGP-signature authentication module for nginx
+ ngx_http_pgp_auth is a native nginx module that authenticates users by PGP
+ signature, as a drop-in alternative to HTTP basic auth for protecting
+ reverse-proxied apps and internal tools.
+ .
+ A protected location serves a one-time challenge. The user signs it with
+ their own key (for example Kleopatra's Notepad), pastes the signed block
+ back, and the module verifies it against a public keyring before granting a
+ session. No passwords are stored or transmitted, and the user's private key
+ never leaves their machine.
+ .
+ Features include stateless HMAC-signed challenge and session tokens,
+ single-use challenge enforcement (in shared memory or via Redis), key
+ revocation by fingerprint, an adaptive per-IP failure throttle, and
+ non-blocking signature verification on an nginx thread pool.
+ .
+ This package provides the module built against this Debian release's nginx.

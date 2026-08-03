@@ -1,0 +1,164 @@
+name: packages
+
+# Debian packaging: build the module as a .deb for each supported release,
+# prove the built package actually works by installing it and running the
+# module's own end-to-end suite against the INSTALLED module, and (on a tag or
+# manual run) publish a signed APT repository to GitHub Pages.
+
+on:
+  push:
+    branches: [ main, master, 'feat/**' ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build .deb (${{ matrix.release }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ bookworm, trixie ]
+    container:
+      image: debian:${{ matrix.release }}-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential debhelper devscripts dpkg-dev ca-certificates git \
+            nginx-dev libssl-dev libpcre2-dev zlib1g-dev lintian
+
+      - uses: actions/checkout@v4
+
+      - name: Build the package
+        run: |
+          # Version the package per release so one repository can serve both.
+          dch --local "~${{ matrix.release }}" --distribution "${{ matrix.release }}" \
+              "Build for Debian ${{ matrix.release }}." || true
+          dpkg-buildpackage -us -uc -b
+          mkdir -p dist/${{ matrix.release }}
+          cp ../*.deb dist/${{ matrix.release }}/
+
+      - name: Lintian
+        run: lintian --no-tag-display-limit dist/${{ matrix.release }}/*.deb || true
+
+      - name: Show package metadata (ABI dependency must be present)
+        run: |
+          for d in dist/${{ matrix.release }}/*.deb; do
+            echo "=== $d ==="
+            dpkg-deb -I "$d" | sed -n '/Package:/,/Description:/p'
+            dpkg-deb -c "$d"
+          done
+          # Check the module package specifically -- the build also produces a
+          # -dbgsym package, which carries no nginx-abi dependency.
+          mod_deb=$(ls dist/${{ matrix.release }}/libnginx-mod-http-pgp-auth_*.deb | head -1)
+          echo "checking $mod_deb"
+          dpkg-deb -I "$mod_deb" | grep -q 'nginx-abi-' \
+            || { echo "::error::module package has no nginx-abi dependency"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.release }}
+          path: dist/${{ matrix.release }}/*.deb
+
+  install-test:
+    name: install + e2e on the installed package (${{ matrix.release }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ bookworm, trixie ]
+    container:
+      image: debian:${{ matrix.release }}-slim
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            nginx gnupg curl ca-certificates redis-server procps
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.release }}
+          path: pkg
+
+      - name: Install the package
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y -qq ./pkg/libnginx-mod-http-pgp-auth_*.deb
+          echo "=== module is enabled? ==="
+          ls -l /etc/nginx/modules-enabled/
+          test -f /usr/lib/nginx/modules/ngx_http_pgp_auth_module.so
+
+      - name: nginx accepts the configuration with the module loaded
+        run: nginx -t
+
+      - name: End-to-end suite against the INSTALLED module
+        run: |
+          # The strongest packaging check: not "does it compile" but "does the
+          # shipped package actually authenticate".
+          NGINX_BIN=/usr/sbin/nginx \
+          MODULE_SO=/usr/lib/nginx/modules/ngx_http_pgp_auth_module.so \
+            sh test/run-tests.sh
+
+      - name: Package removes cleanly
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get remove -y -qq libnginx-mod-http-pgp-auth
+          test ! -e /etc/nginx/modules-enabled/50-mod-http-pgp-auth.conf \
+            || { echo "::error::module still enabled after removal"; exit 1; }
+          nginx -t
+
+  publish:
+    name: publish signed APT repository
+    needs: install-test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+
+      - name: Normalise artifact layout
+        run: |
+          # download-artifact gives dist/deb-<release>/*.deb; the repo builder
+          # expects dist/<release>/*.deb
+          for d in dist/deb-*; do
+            rel="${d#dist/deb-}"
+            mkdir -p "dist/$rel" && mv "$d"/*.deb "dist/$rel/" && rmdir "$d"
+          done
+          ls -R dist
+
+      - name: Build the signed repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$APT_GPG_PRIVATE_KEY" ]; then
+            echo "::warning::APT_GPG_PRIVATE_KEY secret is not set -- the repository would be unsigned; skipping publish."
+            exit 0
+          fi
+          sh packaging/build-apt-repo.sh "$PWD/dist" "$PWD/public"
+
+      - name: Deploy to GitHub Pages
+        if: hashFiles('public/dists/**') != ''
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          keep_files: true
