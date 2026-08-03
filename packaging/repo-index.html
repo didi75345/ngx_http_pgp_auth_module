@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ngx_http_pgp_auth &mdash; Debian package repository</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  .sub { opacity: .75; margin-top: 0; }
+  pre { background: rgba(127,127,127,.12); padding: .9rem 1rem; border-radius: .5rem;
+        overflow-x: auto; font-size: .9rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(127,127,127,.25); }
+  footer { margin-top: 2.5rem; font-size: .85rem; opacity: .7; }
+</style>
+</head>
+<body>
+
+<h1>ngx_http_pgp_auth</h1>
+<p class="sub">APT repository &mdash; PGP-signature authentication for nginx.</p>
+
+<h2>Install</h2>
+<pre><code># trust the archive key
+curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg
+
+# add the repository
+echo "deb [signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
+https://didi75345.github.io/ngx_http_pgp_auth_module $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/pgp-auth.list
+
+# install
+sudo apt update &amp;&amp; sudo apt install libnginx-mod-http-pgp-auth
+sudo systemctl reload nginx</code></pre>
+
+<h2>What you get</h2>
+<table>
+  <tr><th>Module</th><td><code>/usr/lib/nginx/modules/ngx_http_pgp_auth_module.so</code></td></tr>
+  <tr><th>Enabled via</th><td><code>/etc/nginx/modules-enabled/50-mod-http-pgp-auth.conf</code></td></tr>
+  <tr><th>Releases</th><td>Debian Bookworm, Debian Trixie</td></tr>
+  <tr><th>Depends</th><td><code>nginx-abi-&lt;version&gt;</code>, <code>gnupg</code></td></tr>
+</table>
+
+<p>Each package is built against its own Debian release's nginx and depends on
+that nginx's ABI, so apt will refuse to install a module that does not match the
+installed nginx rather than leaving you with a server that will not start.</p>
+
+<h2>Configure</h2>
+<pre><code>location /admin/ {
+    pgp_auth              on;
+    pgp_keyring           /etc/nginx/pubkeys.gpg;
+    pgp_session_secret    /etc/nginx/pgp_secret.key;
+    pgp_challenge_timeout 120s;
+    proxy_pass            http://127.0.0.1:8080;
+}</code></pre>
+
+<footer>
+  Source, documentation and security notes:
+  <a href="https://github.com/didi75345/ngx_http_pgp_auth_module">github.com/didi75345/ngx_http_pgp_auth_module</a>
+</footer>
+
+</body>
+</html>

@@ -1654,6 +1654,16 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
             task->handler = ngx_http_pgp_gpg_thread;
             task->event.handler = ngx_http_pgp_verify_thread_done;
             task->event.data = r;
+            /*
+             * MUST be set: ngx_add_timer()/ngx_del_timer() below log through
+             * ev->log, and on a build with --with-debug (which is how Debian
+             * builds nginx, and therefore how the packaged module is built)
+             * that dereference happens unconditionally -- a NULL ev->log
+             * segfaults the worker on the very first login. A build without
+             * --with-debug compiles those log statements out, which is why
+             * this only shows up on a distro-configured nginx.
+             */
+            task->event.log = r->connection->log;
 
             if (ngx_thread_task_post(plcf->thread_pool, task) == NGX_OK) {
                 ngx_add_timer(&task->event, plcf->gpg_timeout + 10000);
