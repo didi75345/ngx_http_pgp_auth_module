@@ -56,3 +56,7 @@ dkms.conf
 
 # local build tree (downloaded nginx source)
 /build/
+
+# packaging build outputs
+/dist/
+/public/

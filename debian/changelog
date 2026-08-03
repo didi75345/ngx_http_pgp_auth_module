@@ -1,0 +1,8 @@
+nginx-pgp-auth (1.0.0) unstable; urgency=medium
+
+  * Initial Debian package for the ngx_http_pgp_auth nginx module.
+    Builds the module against this release's nginx using its own configure
+    flags, installs it as a dynamic module, and enables it via
+    /etc/nginx/modules-enabled.
+
+ -- didi75345 <didi75345@users.noreply.github.com>  Mon, 27 Jul 2026 00:00:00 +0000

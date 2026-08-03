@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+#
+# Packaging for the ngx_http_pgp_auth nginx module.
+#
+# Nothing to override: nginx-dev ships a debhelper buildsystem ("nginx_mod")
+# that is selected automatically because this source tree has a top-level
+# nginx `config` file. It compiles the module against the nginx source shipped
+# by nginx-dev, using that Debian release's own configure flags
+# (/usr/share/nginx/src/conf_flags, which include --with-compat) plus
+# dpkg-buildflags, and installs the resulting .so into /usr/lib/nginx/modules.
+#
+# dh_nginx (--with nginx) then installs the module load snippet listed in
+# debian/libnginx-mod-http-pgp-auth.nginx, generates the maintainer scripts
+# that symlink it into /etc/nginx/modules-enabled, and fills in ${nginx:abi}
+# so the package depends on the exact nginx ABI it was built against.
+#
+# Doing it this way -- rather than hand-rolling the build -- is what guarantees
+# the module is binary-compatible with the distribution's nginx.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --with nginx
+
+# The end-to-end suite needs a running nginx, generated gpg keys and network
+# ports, so it is not run at package-build time. The packaging CI runs it
+# against the INSTALLED package instead, which is the stronger check: it proves
+# the shipped .deb loads and authenticates, not merely that the source builds.
+override_dh_auto_test:

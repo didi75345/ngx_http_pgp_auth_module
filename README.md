@@ -114,7 +114,44 @@ location / {
 }
 ```
 
-## Build
+## Install from the APT repository (Debian)
+
+Packages are published for Debian **Bookworm** and **Trixie**, built against
+each release's own nginx:
+
+```sh
+# 1. trust the archive key
+curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg
+
+# 2. add the repository (replace $(lsb_release -cs) if you prefer to hardcode)
+echo "deb [signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
+https://didi75345.github.io/ngx_http_pgp_auth_module $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/pgp-auth.list
+
+# 3. install
+sudo apt update && sudo apt install libnginx-mod-http-pgp-auth
+sudo systemctl reload nginx
+```
+
+The package installs the module to `/usr/lib/nginx/modules/` and enables it via
+`/etc/nginx/modules-enabled/50-mod-http-pgp-auth.conf`, so no `load_module`
+line is needed by hand. It depends on the `nginx-abi-<version>` virtual package,
+so apt will refuse to install a module built for a different nginx rather than
+letting nginx fail to start.
+
+To build the packages yourself (each in a container for its target release):
+
+```sh
+packaging/build-deb.sh trixie      # -> dist/trixie/*.deb
+packaging/build-deb.sh bookworm    # -> dist/bookworm/*.deb
+packaging/build-apt-repo.sh dist public   # signed repo tree in ./public
+```
+
+See [packaging/README.md](packaging/README.md) for repository hosting and
+signing-key details.
+
+## Build from source
 
 The module needs the system `gpg` binary at runtime and OpenSSL at build time
 (already an nginx dependency). Verification shells out to `gpg`, so there is no

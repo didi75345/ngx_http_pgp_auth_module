@@ -31,6 +31,7 @@ RUN curl -fsSL -o nginx.tgz "https://nginx.org/download/nginx-${NGINX_VERSION}.t
     && cd "nginx-${NGINX_VERSION}" \
     && ./configure --with-compat --add-dynamic-module=/src \
                    --with-http_ssl_module --with-http_v2_module --with-threads \
+                   --with-debug \
     && make -j"$(nproc)" \
     && cp objs/nginx /build/nginx \
     && cp objs/ngx_http_pgp_auth_module.so /build/module.so
