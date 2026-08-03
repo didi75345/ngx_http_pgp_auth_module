@@ -55,8 +55,12 @@ jobs:
             dpkg-deb -I "$d" | sed -n '/Package:/,/Description:/p'
             dpkg-deb -c "$d"
           done
-          dpkg-deb -I dist/${{ matrix.release }}/*.deb | grep -q 'nginx-abi-' \
-            || { echo "::error::package has no nginx-abi dependency"; exit 1; }
+          # Check the module package specifically -- the build also produces a
+          # -dbgsym package, which carries no nginx-abi dependency.
+          mod_deb=$(ls dist/${{ matrix.release }}/libnginx-mod-http-pgp-auth_*.deb | head -1)
+          echo "checking $mod_deb"
+          dpkg-deb -I "$mod_deb" | grep -q 'nginx-abi-' \
+            || { echo "::error::module package has no nginx-abi dependency"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -91,7 +95,7 @@ jobs:
       - name: Install the package
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get install -y -qq ./pkg/*.deb
+          apt-get install -y -qq ./pkg/libnginx-mod-http-pgp-auth_*.deb
           echo "=== module is enabled? ==="
           ls -l /etc/nginx/modules-enabled/
           test -f /usr/lib/nginx/modules/ngx_http_pgp_auth_module.so
