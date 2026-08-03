@@ -1,0 +1,6 @@
+# dh_nginx stanza: "mod <source> [priority]"
+# The module .so is installed by the nginx_mod buildsystem; this installs the
+# load snippet into /usr/share/nginx/modules-available and generates the
+# maintainer scripts that symlink it as
+# /etc/nginx/modules-enabled/50-mod-http-pgp-auth.conf.
+mod debian/mod-http-pgp-auth.conf 50
