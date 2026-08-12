@@ -44,9 +44,10 @@ docker run --rm \
         cd /out
 
         # pool/ + per-release package indices
-        for rel in $(ls /dist); do
-            [ -d "/dist/$rel" ] || continue
-            ls /dist/$rel/*.deb >/dev/null 2>&1 || continue
+        for relpath in /dist/*; do
+            [ -d "$relpath" ] || continue
+            rel="${relpath#/dist/}"
+            ls "/dist/$rel"/*.deb >/dev/null 2>&1 || continue
 
             mkdir -p "pool/$rel" "dists/$rel/main/binary-${ARCH}"
             cp -f /dist/$rel/*.deb "pool/$rel/"
@@ -75,14 +76,33 @@ docker run --rm \
             KEYID=$(gpg --list-secret-keys --with-colons | awk -F: "/^sec/{print \$5; exit}")
             [ -n "$KEYID" ] || { echo "no secret key imported" >&2; exit 1; }
 
-            PASS=""
-            [ -n "${APT_GPG_PASSPHRASE:-}" ] && PASS="--pinentry-mode loopback --passphrase ${APT_GPG_PASSPHRASE}"
+            # The passphrase is written to a 0600 file inside the throwaway
+            # GNUPGHOME and passed with --passphrase-file; it is never put on
+            # the gpg command line. Two reasons: an argv passphrase is readable
+            # in the process list, and the option string had to be expanded
+            # UNQUOTED, so an ordinary passphrase containing a space word-split
+            # and broke signing outright (gpg then saw --default-key/--clearsign
+            # as passphrase words and refused with "no command supplied").
+            if [ -n "${APT_GPG_PASSPHRASE:-}" ]; then
+                printf "%s" "$APT_GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+                chmod 600 "$GNUPGHOME/passphrase"
+            fi
 
-            for rel in $(ls dists 2>/dev/null); do
-                gpg --batch --yes $PASS --default-key "$KEYID" \
-                    --clearsign -o "dists/$rel/InRelease" "dists/$rel/Release"
-                gpg --batch --yes $PASS --default-key "$KEYID" \
-                    -abs -o "dists/$rel/Release.gpg" "dists/$rel/Release"
+            gpg_sign() {
+                if [ -f "$GNUPGHOME/passphrase" ]; then
+                    gpg --batch --yes --pinentry-mode loopback \
+                        --passphrase-file "$GNUPGHOME/passphrase" \
+                        --default-key "$KEYID" "$@"
+                else
+                    gpg --batch --yes --default-key "$KEYID" "$@"
+                fi
+            }
+
+            for relpath in dists/*; do
+                [ -d "$relpath" ] || continue
+                rel="${relpath#dists/}"
+                gpg_sign --clearsign -o "dists/$rel/InRelease" "dists/$rel/Release"
+                gpg_sign -abs -o "dists/$rel/Release.gpg" "dists/$rel/Release"
             done
 
             # public key for clients (both armoured and dearmoured forms)

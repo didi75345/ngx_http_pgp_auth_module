@@ -116,8 +116,8 @@ location / {
 
 ## Install from the APT repository (Debian)
 
-Packages are published for Debian **Bookworm** and **Trixie**, built against
-each release's own nginx:
+Packages are published for Debian **Bookworm** and **Trixie** (**amd64**), built
+against each release's own nginx:
 
 ```sh
 # 1. trust the archive key
@@ -125,7 +125,7 @@ curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive
   | sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg
 
 # 2. add the repository (replace $(lsb_release -cs) if you prefer to hardcode)
-echo "deb [signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
 https://didi75345.github.io/ngx_http_pgp_auth_module $(lsb_release -cs) main" \
   | sudo tee /etc/apt/sources.list.d/pgp-auth.list
 

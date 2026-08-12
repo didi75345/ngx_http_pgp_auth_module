@@ -46,7 +46,11 @@ jobs:
           cp ../*.deb dist/${{ matrix.release }}/
 
       - name: Lintian
-        run: lintian --no-tag-display-limit dist/${{ matrix.release }}/*.deb || true
+        # Enforced, not advisory: the packages are currently lintian-clean on
+        # both releases, so a new error means a real packaging regression.
+        # Errors fail the build; warnings/info are shown but tolerated, since a
+        # lintian upgrade can introduce new lower-severity tags on its own.
+        run: lintian --tag-display-limit 0 --fail-on error dist/${{ matrix.release }}/*.deb
 
       - name: Show package metadata (ABI dependency must be present)
         run: |
