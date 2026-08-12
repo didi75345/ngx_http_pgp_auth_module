@@ -205,6 +205,14 @@ close operational gaps.
   `limit_req` alone) if its zone is full, since it is an extra layer rather than
   the primary control.
 
+  **Every** failed login submission counts, including the ones rejected before
+  gpg is forked (a body that is not a clear-signed message, or one that could not
+  be read). Those are the cheapest failures to automate, so a throttle that
+  ignored them would miss exactly the client it exists to catch. A user who
+  simply mis-pastes a signature therefore also accumulates failures — size
+  `pgp_auth_failure_limit` with that in mind, and note that one successful login
+  clears the count.
+
 ## Login endpoint: cost, thread pool, and `limit_req`
 
 Verifying a signature means forking `gpg` and waiting for it. By default that

@@ -21,7 +21,7 @@ cleanup() {
     # before removing the work tree. Without the wait, a worker still flushing a
     # log file races `rm -rf` and it fails with "Directory not empty", whose
     # non-zero status would then fail the whole run even though the tests passed.
-    for _pf in nginx redis-nginx; do
+    for _pf in nginx redis-nginx thr-nginx; do
         [ -f "$WORK/logs/$_pf.pid" ] \
             && kill "$(cat "$WORK/logs/$_pf.pid")" 2>/dev/null
     done
@@ -839,6 +839,74 @@ curl -s -H "Cookie: $ROTCK" "$base/rot-done/" -o "$WORK/rd" >/dev/null
 grep -q '__pgp_auth' "$WORK/rd" \
     && ok "rotation: old-secret session is rejected once the previous secret is removed" \
     || bad "rotation: old-secret session still accepted after the previous secret was removed"
+
+# --- adaptive per-IP failure throttle -----------------------------------------
+# Runs on its own nginx instance: the throttle is keyed on the client IP in one
+# shared zone, and the main suite deliberately sends many failed logins from
+# 127.0.0.1, which would ban itself mid-run. limit=3 lets one sequence prove
+# both behaviours -- that failures accumulate to a ban, and that a SUCCESSFUL
+# login clears the counter (the client just proved it is not the attacker).
+{
+    [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
+    [ "$(id -u)" = 0 ] && echo "user root;"
+    cat <<EOF
+worker_processes 1; daemon off; error_log $WORK/logs/thr-nginx.log info;
+pid $WORK/logs/thr-nginx.pid;
+events { worker_connections 32; }
+http {
+    server {
+        listen $((PORT + 70));
+        location / {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_auth_failure_limit 3;
+            pgp_auth_failure_window 60s;
+            pgp_auth_failure_ban_time 300s;
+            root $WORK/html;
+        }
+    }
+}
+EOF
+} > "$WORK/conf/thr.conf"
+"$NGINX_BIN" -p "$WORK" -c conf/thr.conf &
+sleep 1
+tbase="http://127.0.0.1:$((PORT + 70))"
+
+thr_fail() {   # one failed login attempt (rejected before gpg by the pre-check)
+    curl -s -o /dev/null -X POST "$tbase/?__pgp_auth=1" \
+         --data-urlencode "signed=not-a-clear-signed-message" 2>/dev/null
+}
+thr_code() { curl -s -o /dev/null -w '%{http_code}' "$tbase/" 2>/dev/null; }
+
+thr_fail; thr_fail                     # 2 of 3 -- not banned yet
+[ "$(thr_code)" = 429 ] \
+    && bad "throttle bans too early (2 failures with limit 3)" \
+    || ok "throttle does not ban below the configured limit"
+
+# a SUCCESSFUL login must clear that counter
+curl -s "$tbase/" -o "$WORK/thrp" >/dev/null
+THCH="$(challenge "$WORK/thrp")"
+printf '%s' "$THCH" | gpg --clearsign --batch > "$WORK/thr.asc" 2>/dev/null
+curl -s -o /dev/null -D "$WORK/hthr" -X POST "$tbase/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/thr.asc"
+grep -qi '^set-cookie:' "$WORK/hthr" \
+    && ok "throttle: a valid login still succeeds while failures are pending" \
+    || bad "throttle: valid login blocked before the limit"
+
+thr_fail; thr_fail                     # 2 again -- only bans if the reset failed
+[ "$(thr_code)" = 429 ] \
+    && bad "throttle: a successful login did not clear the failure counter" \
+    || ok "throttle: a successful login clears the failure counter"
+
+thr_fail                               # 3rd since the reset -> ban
+THCODE="$(thr_code)"
+[ "$THCODE" = 429 ] \
+    && ok "throttle bans the client after the configured number of failures (429)" \
+    || bad "throttle ban not applied (got $THCODE)"
+
+[ -f "$WORK/logs/thr-nginx.pid" ] && kill "$(cat "$WORK/logs/thr-nginx.pid")" 2>/dev/null
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

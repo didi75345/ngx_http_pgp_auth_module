@@ -1644,8 +1644,16 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
     r->keepalive = 0;
 
     if (ngx_http_pgp_read_body(r, &body, plcf->max_body_size) != NGX_OK) {
-        ngx_http_finalize_request(r,
-            ngx_http_pgp_send_challenge(r, plcf, 1));
+        /*
+         * Go through verify_finalize (rather than answering directly) so this
+         * counts as a failed attempt for the per-IP throttle. A submission that
+         * never reaches verification is still a failed login attempt, and it is
+         * the cheapest one to automate -- if it were not counted, a client could
+         * hammer the login endpoint indefinitely without the throttle ever
+         * seeing it.
+         */
+        ngx_http_pgp_log_event(r, "denied", "unreadable_body", NULL);
+        ngx_http_pgp_verify_finalize(r, plcf, NGX_DECLINED);
         return;
     }
 
@@ -1655,7 +1663,10 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
 
     /* cheap pre-check in the worker, before any (blocking) gpg work */
     if (ngx_http_pgp_verify_pre(r, signed_msg.data, signed_msg.len) != NGX_OK) {
-        ngx_http_finalize_request(r, ngx_http_pgp_send_challenge(r, plcf, 1));
+        /* Same reasoning as the body-read failure above: rejected before gpg is
+         * still a failed attempt, and must be visible to the throttle. */
+        ngx_http_pgp_log_event(r, "denied", "not_clear_signed", NULL);
+        ngx_http_pgp_verify_finalize(r, plcf, NGX_DECLINED);
         return;
     }
 
