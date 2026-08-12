@@ -34,14 +34,13 @@ docker run --rm \
         export DEBFULLNAME="${DEBFULLNAME:-didi75345}"
         # Version the package per release so one apt repo can serve both.
         NGXVER=$(dpkg-query -W -f="\${Version}" nginx-dev 2>/dev/null | sed "s/[-+].*//")
-        BASEVER=$(dpkg-parsechangelog -S Version | sed "s/~.*//")
         dch --local "~${RELEASE}" --distribution "$RELEASE" \
             "Build for Debian ${RELEASE} (nginx ${NGXVER})." >/dev/null 2>&1 || true
 
         dpkg-buildpackage -us -uc -b
         cp -v ../*.deb /out/
         echo "=== lintian ==="
-        lintian --no-tag-display-limit /out/*.deb || true
+        lintian --tag-display-limit 0 --fail-on error /out/*.deb || true
     '
 echo "built into: $OUTDIR"
 ls -1 "$OUTDIR"
