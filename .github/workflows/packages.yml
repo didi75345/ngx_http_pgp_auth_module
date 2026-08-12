@@ -37,6 +37,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build the package
+        env:
+          # Without these, dch stamps the changelog entry with root@<container-id>,
+          # which ships in the package and fails lintian
+          # (bogus-mail-host-in-debian-changelog). packaging/build-deb.sh already
+          # sets them; CI has to as well, or the published package differs from
+          # the locally built one.
+          DEBEMAIL: didi75345@users.noreply.github.com
+          DEBFULLNAME: didi75345
         run: |
           # Version the package per release so one repository can serve both.
           dch --local "~${{ matrix.release }}" --distribution "${{ matrix.release }}" \
