@@ -14,7 +14,7 @@ docker run --rm \
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends \
-            nginx gnupg curl ca-certificates redis-server procps >/dev/null
+            nginx gnupg curl ca-certificates redis-server procps python3-minimal >/dev/null
 
         echo "=== installing the package ==="
         apt-get install -y -qq /pkg/libnginx-mod-http-pgp-auth_*.deb

@@ -94,8 +94,11 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
+          # python3 drives the raw socket in the request-smuggling/pipelining
+          # regression test; without it that test silently SKIPs, so the packaged
+          # lane would not cover the fix at all.
           apt-get install -y -qq --no-install-recommends \
-            nginx gnupg curl ca-certificates redis-server procps
+            nginx gnupg curl ca-certificates redis-server procps python3-minimal
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
