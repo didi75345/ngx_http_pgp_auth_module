@@ -28,9 +28,10 @@ SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 mkdir -p "$OUTDIR"
 
-# The private key is handed over as a 0600 file on a private mount rather than
-# in the container's environment: an environment variable is readable through
-# `docker inspect` and /proc/<pid>/environ for the life of the container.
+# The private key and its passphrase are handed over as 0600 files on a private
+# mount rather than in the container's environment: an environment variable is
+# readable through `docker inspect` and /proc/<pid>/environ for the life of the
+# container, and anything that can read one of the two can read the other.
 KEYDIR=$(mktemp -d)
 chmod 700 "$KEYDIR"
 trap 'rm -rf "$KEYDIR"' EXIT INT TERM
@@ -38,13 +39,16 @@ if [ -n "${APT_GPG_PRIVATE_KEY:-}" ]; then
     printf '%s' "$APT_GPG_PRIVATE_KEY" > "$KEYDIR/private.asc"
     chmod 600 "$KEYDIR/private.asc"
 fi
+if [ -n "${APT_GPG_PASSPHRASE:-}" ]; then
+    printf '%s' "$APT_GPG_PASSPHRASE" > "$KEYDIR/passphrase"
+    chmod 600 "$KEYDIR/passphrase"
+fi
 
 docker run --rm \
     -v "$DISTDIR":/dist:ro \
     -v "$OUTDIR":/out \
     -v "$SRCDIR":/src:ro \
     -e "ORIGIN=$ORIGIN" -e "LABEL=$LABEL" -e "ARCH=$ARCH" \
-    -e "APT_GPG_PASSPHRASE=${APT_GPG_PASSPHRASE:-}" \
     -v "$KEYDIR":/keys:ro \
     debian:trixie-slim \
     bash -eu -c '
@@ -108,8 +112,8 @@ docker run --rm \
             # UNQUOTED, so an ordinary passphrase containing a space word-split
             # and broke signing outright (gpg then saw --default-key/--clearsign
             # as passphrase words and refused with "no command supplied").
-            if [ -n "${APT_GPG_PASSPHRASE:-}" ]; then
-                printf "%s" "$APT_GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+            if [ -f /keys/passphrase ]; then
+                cp /keys/passphrase "$GNUPGHOME/passphrase"
                 chmod 600 "$GNUPGHOME/passphrase"
             fi
 
