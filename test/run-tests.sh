@@ -133,6 +133,11 @@ chmod +x "$WORK/fakegpg"
 # over to a location whose keyring does not contain it.
 GNUPGHOME="$WORK/gpg2" gpg --export evil@example.com > "$WORK/pubkeys-b.gpg" 2>/dev/null
 
+# a revocation list deliberately over pgp_revocation_list_max_size (set to 1k
+# for the /revoc-big/ location below): it must be refused, and refusing it must
+# fail CLOSED like any other unreadable list.
+head -c 4096 /dev/zero | tr '\0' 'A' > "$WORK/revoked-big.txt"
+
 # --- nginx config ------------------------------------------------------------
 {
     [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
@@ -201,6 +206,15 @@ http {
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_revocation_list $WORK/revoked-primary.txt;
+            root $WORK/html;
+        }
+        location /revoc-big/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-big.txt;
+            pgp_revocation_list_max_size 1k;
+            pgp_auth_nonce_storage none;
             root $WORK/html;
         }
         location /revoc-cr/ {
@@ -1033,6 +1047,30 @@ PYPIPE
         || bad "unread body parsed as a pipelined request ($NRESP responses on one connection)"
 else
     echo "  SKIP  pipelining check (python3 not available)"
+fi
+
+# An oversized revocation list must be refused and must fail closed.
+curl -s "$base/revoc-big/" -o "$WORK/rbp" >/dev/null
+RBCH="$(challenge "$WORK/rbp")"
+printf '%s' "$RBCH" | gpg --clearsign --batch > "$WORK/rb.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-big/?__pgp_auth=1" --data-urlencode "signed@$WORK/rb.asc" \
+     -D "$WORK/hrb" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hrb" \
+    && bad "oversized revocation list is refused and fails closed" \
+    || ok "oversized revocation list is refused and fails closed"
+
+# The login response hands out the session cookie: it must not be cacheable.
+curl -s "$base/" -o "$WORK/ncp" >/dev/null
+NCCH="$(challenge "$WORK/ncp")"
+printf '%s' "$NCCH" | gpg --clearsign --batch > "$WORK/nc.asc" 2>/dev/null
+curl -s -o /dev/null -D "$WORK/hnc" -X POST "$base/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/nc.asc"
+if grep -qi '^set-cookie:' "$WORK/hnc"; then
+    grep -qi '^cache-control:.*no-store' "$WORK/hnc" \
+        && ok "the session-issuing response is marked no-store" \
+        || bad "session-issuing response has no Cache-Control: no-store"
+else
+    bad "no-store test setup: login did not grant a session"
 fi
 
 echo
