@@ -32,6 +32,7 @@ typedef struct {
     ngx_shm_zone_t  *zone;         /* shared zone for the memory backend     */
     ngx_str_t        addr;         /* redis numeric host:port                */
     ngx_str_t        password;     /* redis AUTH password (optional)         */
+    ngx_str_t        key_prefix;   /* redis key namespace, default "pgp:"    */
     ngx_flag_t       tls;          /* connect to redis over TLS              */
     ngx_flag_t       tls_verify;   /* verify the redis certificate (default) */
     ngx_str_t        tls_ca;       /* CA bundle; empty = system trust store   */

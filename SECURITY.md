@@ -47,7 +47,8 @@ Everything else (the keyring, the secret) is operator-controlled.
 - **Rate-limitable logins.** Each login attempt forks a gpg verification, so
   submissions should be capped with nginx's own `limit_req` keyed on the
   `__pgp_auth` argument — see `examples/nginx.conf` for the exact pattern.
-  Combined with the 5s gpg timeout this bounds the work an attacker can cause.
+  Combined with `pgp_gpg_timeout` (2s by default, clamped to 1s..60s) this
+  bounds the work an attacker can cause.
 
 ## Hardening from the security review
 
@@ -236,6 +237,14 @@ close operational gaps.
   already-reviewed nonce-store shared-memory design, and fails open (degrades to
   `limit_req` alone) if its zone is full, since it is an extra layer rather than
   the primary control.
+
+  **It bans by the client address nginx sees.** Behind a reverse proxy or CDN
+  without `ngx_http_realip_module`, and on a Tor onion service (where every
+  request arrives from the local daemon), that address is identical for every
+  client -- so one abusive client would ban *all* of them for
+  `pgp_auth_failure_ban_time`, and an attacker can trigger that deliberately.
+  Configure realip first, or leave the throttle off in those deployments; the
+  module logs this reminder at start-up whenever the throttle is enabled.
 
   **Every** failed login submission counts, including the ones rejected before
   gpg is forked (a body that is not a clear-signed message, or one that could not
@@ -533,6 +542,19 @@ grants would just be the same weakness behind a flag. The honest alternative is
 - **A black-holed Redis costs 500 ms per login attempt** (the connect deadline).
   Keep `pgp_gpg_thread_pool` on so that wait is off the worker's event loop, and
   keep the global `limit_req` from `examples/nginx.conf` in place.
+
+### Known limits of this document's assurances
+
+- **Fuzzing covers the two parsers that take the most adversarial input** (the
+  form-field decoder and the gpg status parser, as standalone mirrors). The
+  revocation-list scanner and the Redis reply parser are not fuzzed; they read
+  an operator-supplied file and a semi-trusted network peer respectively.
+- **A duplicate session cookie is resolved by taking the first match.** With the
+  default `__Host-` prefix a sibling subdomain cannot set one, but with
+  `pgp_session_cookie_secure off` (plain HTTP / onion deployments) the prefix is
+  dropped, so a sibling subdomain could plant a second `pgp_session` cookie and
+  force the user to be re-challenged. It cannot forge a session -- the MAC still
+  has to verify -- so the effect is nuisance, not bypass.
 
 ## Verification
 

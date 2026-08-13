@@ -617,11 +617,18 @@ ngx_http_pgp_nonce_redis(ngx_http_pgp_verify_result_t *vr, ngx_http_pgp_nonce_co
         }
     }
 
-    /* RESP: SET pgp:<nonce> 1 NX EX <ttl> */
+    /*
+     * RESP: SET <prefix><nonce> 1 NX EX <ttl>
+     *
+     * The prefix is configurable (pgp_auth_nonce_storage_key_prefix) so two
+     * deployments can share one Redis without sharing a keyspace -- otherwise
+     * anything else able to write that instance can delete this module's keys
+     * and defeat single-use, or pre-create them and deny logins.
+     */
     off = (size_t) (ngx_snprintf((u_char *) buf, sizeof(buf),
-        "*6\r\n$3\r\nSET\r\n$%uz\r\npgp:%V\r\n$1\r\n1\r\n"
+        "*6\r\n$3\r\nSET\r\n$%uz\r\n%V%V\r\n$1\r\n1\r\n"
         "$2\r\nNX\r\n$2\r\nEX\r\n$%uz\r\n%*s\r\n",
-        (size_t) (nonce->len + 4), nonce,
+        (size_t) (nc->key_prefix.len + nonce->len), &nc->key_prefix, nonce,
         ttl_len, ttl_len, ttlbuf) - (u_char *) buf);
 
     k = ngx_http_pgp_nonce_redis_roundtrip(fd, ssl, buf, off, reply,

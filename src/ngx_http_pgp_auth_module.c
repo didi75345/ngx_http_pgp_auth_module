@@ -84,12 +84,14 @@ typedef struct {
     ngx_str_t    nonce_addr;          /* redis host:port                    */
     ngx_str_t    nonce_password;      /* redis AUTH password (optional)     */
     ngx_str_t    nonce_password_file; /* load AUTH password from a file     */
+    ngx_str_t    nonce_key_prefix;    /* redis key namespace                */
     ngx_flag_t   nonce_tls;           /* reach redis over TLS               */
     ngx_flag_t   nonce_tls_verify;    /* verify the redis certificate       */
     ngx_str_t    nonce_tls_ca;        /* CA bundle (empty = system store)   */
     ngx_str_t    nonce_tls_name;      /* expected cert name / SNI           */
     ngx_str_t    revocation_list;     /* path: revoked key fingerprints     */
     ngx_flag_t   revoc_fail_open;     /* on error, allow (1) or deny (0)    */
+    size_t       revoc_max_size;      /* refuse a revocation list larger    */
     time_t       revoc_mtime;         /* cached file mtime (per worker)     */
     ngx_str_t    revoc_cache;         /* cached file contents (per worker)  */
     ngx_msec_t   gpg_timeout;         /* max ms for one gpg verify          */
@@ -367,6 +369,20 @@ static ngx_command_t  ngx_http_pgp_auth_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pgp_auth_loc_conf_t, revocation_list),
+      NULL },
+
+    { ngx_string("pgp_auth_nonce_storage_key_prefix"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, nonce_key_prefix),
+      NULL },
+
+    { ngx_string("pgp_revocation_list_max_size"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pgp_auth_loc_conf_t, revoc_max_size),
       NULL },
 
     { ngx_string("pgp_revocation_fail_open"),
@@ -654,6 +670,23 @@ ngx_http_pgp_is_revoked(ngx_http_request_t *r,
             return deny;
         }
         sz = (size_t) ngx_file_size(&fi);
+
+        /*
+         * A revocation list is read into memory per worker and linearly
+         * scanned on every authenticated request, so an accidentally huge file
+         * (or a path pointing at something that is not a list at all) would
+         * cost memory and per-request latency. Refuse it and apply the normal
+         * unreadable-list policy: deny unless pgp_revocation_fail_open is set.
+         */
+        if (plcf->revoc_max_size && sz > plcf->revoc_max_size) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "pgp_auth: revocation list \"%V\" is %uz bytes, over the "
+                "pgp_revocation_list_max_size limit of %uz%s",
+                &plcf->revocation_list, sz, plcf->revoc_max_size,
+                deny ? " (failing closed)" : "");
+            ngx_close_file(fd);
+            return deny;
+        }
         buf = ngx_alloc(sz + 1, r->connection->log);
         if (buf == NULL) {
             ngx_close_file(fd);
@@ -1058,6 +1091,7 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
     nc.zone       = plcf->nonce_zone;
     nc.addr       = plcf->nonce_addr;
     nc.password   = plcf->nonce_password;
+    nc.key_prefix = plcf->nonce_key_prefix;
     nc.tls        = plcf->nonce_tls;
     nc.tls_verify = plcf->nonce_tls_verify;
     nc.tls_ca     = plcf->nonce_tls_ca;
@@ -1221,8 +1255,9 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     time_t            exp;
     u_char           *payload;
     size_t            plen;
+    size_t            cookie_size;
     ngx_str_t         mac, name;
-    ngx_table_elt_t  *set_cookie, *location;
+    ngx_table_elt_t  *set_cookie, *location, *cache;
 
     exp = (plcf->session_timeout == 0) ? 0 : ngx_time() + plcf->session_timeout;
 
@@ -1251,13 +1286,22 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
      * carry the __Host- prefix. __Host- requires Secure + Path=/ + no Domain,
      * all of which hold whenever the prefixed name is chosen.
      */
-    set_cookie->value.data = ngx_pnalloc(r->pool,
-        name.len + 1 + plen + 1 + mac.len
-        + sizeof("; Path=/; HttpOnly; SameSite=Strict; Secure") - 1);
+    /*
+     * Sized from the parts, with the longest SameSite value and a small margin,
+     * and written bounded: the previous expression happened to match the
+     * longest output exactly, so adding any attribute would have overflowed it.
+     */
+    cookie_size = name.len + 1 + plen + 1 + mac.len
+                + sizeof("; Path=/; HttpOnly; SameSite=") - 1
+                + sizeof("Strict") - 1
+                + sizeof("; Secure") - 1
+                + 32;
+
+    set_cookie->value.data = ngx_pnalloc(r->pool, cookie_size);
     if (set_cookie->value.data == NULL) {
         return NGX_ERROR;
     }
-    set_cookie->value.len = ngx_sprintf(set_cookie->value.data,
+    set_cookie->value.len = ngx_snprintf(set_cookie->value.data, cookie_size,
         "%V=%*s|%V; Path=/; HttpOnly; SameSite=%s%s",
         &name, plen, payload, &mac,
         ngx_http_pgp_samesite[plcf->cookie_samesite],
@@ -1274,6 +1318,20 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
      * A relative Location is resolved by the browser against the URL it actually
      * connected to, so it works behind any front end.
      */
+    /*
+     * The response that hands out the session cookie must never be stored by a
+     * shared cache -- a cached copy would serve one user's credential to the
+     * next. A 303 is not heuristically cacheable, but "cache everything" rules
+     * on a CDN in front of this are common enough to say it explicitly.
+     */
+    cache = ngx_list_push(&r->headers_out.headers);
+    if (cache == NULL) {
+        return NGX_ERROR;
+    }
+    cache->hash = 1;
+    ngx_str_set(&cache->key, "Cache-Control");
+    ngx_str_set(&cache->value, "no-store");
+
     location = ngx_list_push(&r->headers_out.headers);
     if (location == NULL) {
         return NGX_ERROR;
@@ -1347,7 +1405,14 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
     }
     clen = ngx_sprintf(challenge, "%*s|%V", plen, payload, &mac) - challenge;
 
-    size = sizeof(ngx_http_pgp_page_head) - 1 + clen + 1024;
+    /*
+     * Slack for everything written after the fixed head: the optional failure
+     * notice plus the instructions/form template. Measured at ~590 bytes, so
+     * 2048 leaves room for edits -- and every write below is bounded
+     * (ngx_snprintf/ngx_cpymem against the remaining space) so exceeding it
+     * truncates the page instead of overflowing the allocation.
+     */
+    size = sizeof(ngx_http_pgp_page_head) - 1 + clen + 2048;
     body = ngx_pnalloc(r->pool, size);
     if (body == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1357,13 +1422,15 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
                      sizeof(ngx_http_pgp_page_head) - 1);
 
     if (failed) {
-        end = ngx_cpymem(end, "<p class=\"err\">Verification failed. "
-                              "Please sign a fresh challenge below.</p>",
-                         sizeof("<p class=\"err\">Verification failed. "
-                              "Please sign a fresh challenge below.</p>") - 1);
+        static const char  notice[] = "<p class=\"err\">Verification failed. "
+                                      "Please sign a fresh challenge below.</p>";
+
+        if ((size_t) (body + size - end) > sizeof(notice) - 1) {
+            end = ngx_cpymem(end, notice, sizeof(notice) - 1);
+        }
     }
 
-    end = ngx_sprintf(end,
+    end = ngx_snprintf(end, (size_t) (body + size - end),
         "<ol><li>Copy the challenge below.</li>"
         "<li>Sign it with your key (e.g. Kleopatra &rarr; Notepad &rarr; "
         "Sign).</li>"
@@ -1777,6 +1844,17 @@ ngx_http_pgp_auth_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
+    /*
+     * Only gate the main request. A subrequest (SSI include, auth_request,
+     * an internal redirect) is generated by the server itself, and issuing a
+     * challenge page as a subrequest body would corrupt the parent response
+     * rather than authenticate anyone; the parent request has already been
+     * through this handler.
+     */
+    if (r != r->main) {
+        return NGX_DECLINED;
+    }
+
     /* already authenticated -> let the request proceed */
     if (ngx_http_pgp_check_session(r, plcf) == NGX_OK) {
         return NGX_DECLINED;
@@ -1881,6 +1959,7 @@ ngx_http_pgp_auth_create_loc_conf(ngx_conf_t *cf)
     conf->failure_ban_time = NGX_CONF_UNSET;
     conf->failure_zone_size = NGX_CONF_UNSET_SIZE;
     conf->revoc_fail_open = NGX_CONF_UNSET;
+    conf->revoc_max_size = NGX_CONF_UNSET_SIZE;
     conf->gpg_timeout = NGX_CONF_UNSET_MSEC;
     conf->max_body_size = NGX_CONF_UNSET_SIZE;
 
@@ -1942,6 +2021,20 @@ ngx_http_pgp_load_secret(ngx_conf_t *cf, ngx_str_t *path, ngx_str_t *out)
         ngx_close_file(fd);
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "pgp_auth: secret file \"%V\" is empty", path);
+        return NGX_ERROR;
+    }
+
+    /*
+     * Upper bound as well as the short-secret warning below: the whole file is
+     * read into the configuration pool, so a path pointing at something that is
+     * not a secret (a log, an archive) would otherwise be loaded in full at
+     * start-up. No legitimate HMAC secret is anywhere near this size.
+     */
+    if (ngx_file_size(&fi) > 65536) {
+        ngx_close_file(fd);
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "pgp_auth: secret file \"%V\" is %O bytes; a secret file must be "
+            "at most 64k -- check the path", path, ngx_file_size(&fi));
         return NGX_ERROR;
     }
 
@@ -2020,6 +2113,45 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * The 5s floor (rather than a larger one) still leaves room for a
      * deliberately short replay window in high-security setups.
      */
+    /*
+     * Bound the remaining lifetimes as well, so a typo cannot quietly create
+     * near-permanent sessions or a throttle that never forgets. 0 keeps its
+     * documented meaning for pgp_session_timeout (no expiry at all).
+     */
+    if (conf->session_timeout != 0 && conf->session_timeout > 2592000) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+            "pgp_auth: pgp_session_timeout %Ts is above the 30d maximum; "
+            "clamping to 2592000s (set 0 if you deliberately want no expiry)",
+            conf->session_timeout);
+        conf->session_timeout = 2592000;
+    }
+
+    if (conf->failure_limit > 0) {
+        if (conf->failure_window < 1 || conf->failure_window > 3600) {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                "pgp_auth: pgp_auth_failure_window %Ts is outside 1s..1h; "
+                "using 60s", conf->failure_window);
+            conf->failure_window = 60;
+        }
+        if (conf->failure_ban_time < 1 || conf->failure_ban_time > 86400) {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                "pgp_auth: pgp_auth_failure_ban_time %Ts is outside 1s..24h; "
+                "using 300s", conf->failure_ban_time);
+            conf->failure_ban_time = 300;
+        }
+
+        /*
+         * The throttle bans by the client address nginx sees. Behind a proxy
+         * without ngx_http_realip_module -- or on a Tor onion service, where
+         * every request arrives from the local daemon -- that address is the
+         * same for everyone, so one abusive client would lock out all of them.
+         */
+        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+            "pgp_auth: the failure throttle bans by client address; behind a "
+            "proxy configure ngx_http_realip_module, otherwise every client "
+            "shares one address and a single abuser locks out all of them");
+    }
+
     if (conf->challenge_timeout < 5) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
             "pgp_auth: pgp_challenge_timeout %Ts is below the 5s minimum; "
@@ -2068,6 +2200,10 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->revocation_list, prev->revocation_list, "");
     /* revocation fails CLOSED by default: an unreadable list denies access */
     ngx_conf_merge_value(conf->revoc_fail_open, prev->revoc_fail_open, 0);
+    ngx_conf_merge_size_value(conf->revoc_max_size, prev->revoc_max_size,
+                              1024 * 1024);
+    ngx_conf_merge_str_value(conf->nonce_key_prefix, prev->nonce_key_prefix,
+                             "pgp:");
     ngx_conf_merge_msec_value(conf->gpg_timeout, prev->gpg_timeout, 2000);
     /*
      * A gpg timeout of a few milliseconds would time out every real
