@@ -1828,6 +1828,23 @@ ngx_http_pgp_auth_handler(ngx_http_request_t *r)
         return NGX_DONE;
     }
 
+    /*
+     * We are about to produce a response body (the challenge page) without
+     * having read the request body, so it must be discarded first -- the same
+     * thing nginx's own content-producing modules do. Without it the unread
+     * bytes stay in the connection buffer and nginx parses them as a PIPELINED
+     * request: a POST to a protected location whose body happens to look like
+     * an HTTP request yields two responses on one connection. Behind a proxy
+     * or CDN -- the deployment this module is written for -- that is a
+     * request/response desync (smuggling) primitive, and even standalone it
+     * breaks the keepalive contract. Error returns above (429/413) do not need
+     * this: nginx's special-response handler discards for them.
+     */
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
     /* unauthenticated GET (or non-submit) -> serve the challenge */
     rc = ngx_http_pgp_send_challenge(r, plcf, 0);
     ngx_http_finalize_request(r, rc);

@@ -112,6 +112,18 @@ Everything else (the keyring, the secret) is operator-controlled.
   PRECONTENT phase, i.e. *after* `limit_req` (PREACCESS) and `auth_basic` /
   `auth_request` (ACCESS), so those can rate-limit or reject a request before
   any gpg work happens, and PGP auth layers on top of them.
+- **The request body is discarded before the challenge page is written.** The
+  challenge is a response body produced from the PRECONTENT phase without
+  reading the request body, so the module calls
+  `ngx_http_discard_request_body()` first, exactly as nginx's own
+  content-producing modules do. Without it the unread bytes stay in the
+  connection buffer and nginx parses them as a *pipelined* request: a POST to a
+  protected location whose body happens to look like an HTTP request produced
+  two responses on one keepalive connection. Behind a proxy or CDN — the
+  deployment this module is written for — a front end that counted one request
+  while the back end answered two is a request/response desync (smuggling)
+  primitive. Error replies (`429`, `413`) do not need this: nginx's
+  special-response handler discards for them.
 - **Relative redirect.** The post-login redirect uses a relative `Location` so
   it resolves against the URL the browser actually used -- correct behind a
   reverse proxy or TLS terminator, where nginx's own scheme/host/port differ.

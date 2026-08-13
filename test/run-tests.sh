@@ -1000,6 +1000,41 @@ else
     fi
 fi
 
+# A response produced without reading the request body must discard it, or the
+# unread bytes stay in the connection buffer and nginx parses them as a
+# PIPELINED request -- one POST then yields two responses on a single keepalive
+# connection, which behind a proxy is a request/response desync. Uses a raw
+# socket: curl cannot express "send a body that is itself a request".
+if command -v python3 >/dev/null 2>&1; then
+    NRESP=$(python3 - "$PORT" <<'PYPIPE'
+import socket, sys
+body = b"GET /pipe-probe HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+req = (b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+       b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+       b"Content-Type: application/x-www-form-urlencoded\r\n\r\n" + body)
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(req)
+s.settimeout(3)
+data = b""
+try:
+    while True:
+        c = s.recv(65536)
+        if not c:
+            break
+        data += c
+except socket.timeout:
+    pass
+s.close()
+print(data.count(b"HTTP/1.1 "))
+PYPIPE
+)
+    [ "${NRESP:-0}" = "1" ] \
+        && ok "request body is discarded (no pipelined second response)" \
+        || bad "unread body parsed as a pipelined request ($NRESP responses on one connection)"
+else
+    echo "  SKIP  pipelining check (python3 not available)"
+fi
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
