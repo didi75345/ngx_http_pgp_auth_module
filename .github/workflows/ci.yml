@@ -17,7 +17,7 @@ jobs:
           - release: trixie
             nginx: 1.26.3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Build + test on Debian ${{ matrix.release }} (nginx ${{ matrix.nginx }})
         run: |
           docker build -f test/Dockerfile \
@@ -30,7 +30,7 @@ jobs:
   sanitizers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -44,7 +44,7 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -52,3 +52,53 @@ jobs:
             gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev curl
       - name: Static analysis (gcc -fanalyzer)
         run: sh test/analyze.sh
+
+  # Valgrind catches a class ASan does not (use of uninitialised values), and
+  # the repository shipped test/memcheck.sh without anything ever running it.
+  memcheck:
+    name: valgrind memcheck
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - name: Install build deps
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev \
+            nginx gnupg curl ca-certificates valgrind
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Build the module against the distro nginx
+        run: |
+          NGXVER=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          curl -sL "https://nginx.org/download/nginx-${NGXVER}.tar.gz" | tar xz
+          cd "nginx-${NGXVER}"
+          ./configure --with-compat --with-threads --with-http_ssl_module \
+                      --add-dynamic-module=..
+          make -j"$(nproc)" modules
+          echo "MODULE_SO=$PWD/objs/ngx_http_pgp_auth_module.so" >> "$GITHUB_ENV"
+      - name: Run under Valgrind
+        run: NGINX_BIN=/usr/sbin/nginx sh test/memcheck.sh
+
+  # The fuzz harnesses shipped in test/fuzz/ were never executed by CI. This is
+  # a short smoke run -- enough to catch a harness that no longer builds or an
+  # input that crashes immediately, not a substitute for a long campaign.
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - name: Install clang
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends clang
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Build the harnesses
+        run: sh test/fuzz/build.sh
+      - name: Fuzz the form-field decoder
+        run: cd test/fuzz && ./fuzz_form_field_decoder -max_len=65536 -max_total_time=60 seeds/
+      - name: Fuzz the gpg status parser
+        run: cd test/fuzz && ./fuzz_gpg_status_parser -max_len=8200 -max_total_time=60 seeds/

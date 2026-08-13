@@ -34,7 +34,7 @@ jobs:
             build-essential debhelper devscripts dpkg-dev ca-certificates git \
             nginx-dev libssl-dev libpcre2-dev zlib1g-dev lintian
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Build the package
         env:
@@ -74,7 +74,7 @@ jobs:
           dpkg-deb -I "$mod_deb" | grep -q 'nginx-abi-' \
             || { echo "::error::module package has no nginx-abi dependency"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: deb-${{ matrix.release }}
           path: dist/${{ matrix.release }}/*.deb
@@ -97,9 +97,9 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             nginx gnupg curl ca-certificates redis-server procps
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: deb-${{ matrix.release }}
           path: pkg
@@ -139,9 +139,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: deb-*
           path: dist
@@ -169,8 +169,11 @@ jobs:
 
       - name: Deploy to GitHub Pages
         if: hashFiles('public/dists/**') != ''
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453  # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./public
-          keep_files: true
+          # false: the job rebuilds the whole repository from the artifacts of
+          # this run, so keeping old files would leave withdrawn packages
+          # fetchable forever alongside a Release that no longer indexes them.
+          keep_files: false
