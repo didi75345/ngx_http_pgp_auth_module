@@ -462,8 +462,8 @@ ngx_module_t  ngx_http_pgp_auth_module = {
  *   layout: kind || 0x1e || data || 0x1e || ip || 0x1e || ua
  */
 static ngx_int_t
-ngx_http_pgp_hmac_raw(ngx_str_t *secret, const char *kind, ngx_str_t *ip,
-    ngx_str_t *ua, u_char *data, size_t len, u_char *out64)
+ngx_http_pgp_hmac_raw(ngx_str_t *secret, const char *kind, ngx_str_t *scope,
+    ngx_str_t *ip, ngx_str_t *ua, u_char *data, size_t len, u_char *out64)
 {
     unsigned int   mdlen;
     unsigned char  md[EVP_MAX_MD_SIZE];
@@ -484,6 +484,19 @@ ngx_http_pgp_hmac_raw(ngx_str_t *secret, const char *kind, ngx_str_t *ip,
     if (HMAC_Init_ex(ctx, secret->data, (int) secret->len, EVP_sha256(), NULL)
             != 1
         || HMAC_Update(ctx, (u_char *) kind, ngx_strlen(kind)) != 1
+        || HMAC_Update(ctx, &sep, 1) != 1
+        /*
+         * Trust-domain binding: the keyring path defines WHICH signers a
+         * location accepts. Without it in the MAC, two locations that share
+         * pgp_session_secret (the documented way to run one secret across a
+         * deployment) but use DIFFERENT keyrings would accept each other's
+         * sessions -- a holder of a key trusted only by the first location
+         * could present that cookie at the second and be let in, because a
+         * session is validated by MAC, expiry and revocation alone; the
+         * keyring is consulted at login, not on later requests. Binding it
+         * here confines a token to the signer set it was issued under.
+         */
+        || HMAC_Update(ctx, scope->data, scope->len) != 1
         || HMAC_Update(ctx, &sep, 1) != 1
         || HMAC_Update(ctx, data, len) != 1
         || HMAC_Update(ctx, &sep, 1) != 1
@@ -553,7 +566,8 @@ ngx_http_pgp_hmac_hex(ngx_http_request_t *r,
 
     ngx_http_pgp_binding(r, plcf, &ip, &ua);
 
-    if (ngx_http_pgp_hmac_raw(&plcf->secret, kind, &ip, &ua, data, len, hex)
+    if (ngx_http_pgp_hmac_raw(&plcf->secret, kind, &plcf->keyring, &ip, &ua,
+                              data, len, hex)
         != NGX_OK)
     {
         return NGX_ERROR;
@@ -819,7 +833,8 @@ ngx_http_pgp_check_session(ngx_http_request_t *r,
             u_char     mac_bytes[64];
 
             ngx_http_pgp_binding(r, plcf, &ip, &ua);
-            if (ngx_http_pgp_hmac_raw(&plcf->secret_previous, "sess", &ip, &ua,
+            if (ngx_http_pgp_hmac_raw(&plcf->secret_previous, "sess",
+                                      &plcf->keyring, &ip, &ua,
                                       payload.data, payload.len, mac_bytes)
                 == NGX_OK)
             {
@@ -983,7 +998,8 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
     s3 = ngx_strlchr(s2 + 1, line_end, '|');                  /* after nonce*/
     if (s3 == NULL) { vr->chal_reason = "malformed_challenge"; return NGX_DECLINED; }
 
-    if (ngx_http_pgp_hmac_raw(&plcf->secret, "chal", ip, ua, p, s3 - p,
+    if (ngx_http_pgp_hmac_raw(&plcf->secret, "chal", &plcf->keyring, ip, ua,
+                              p, s3 - p,
                               mac_bytes) != NGX_OK)
     {
         vr->chal_reason = "hmac_computation_failed";
@@ -1007,7 +1023,8 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
         ngx_int_t  matched_previous = 0;
 
         if (plcf->secret_previous.len
-            && ngx_http_pgp_hmac_raw(&plcf->secret_previous, "chal", ip, ua,
+            && ngx_http_pgp_hmac_raw(&plcf->secret_previous, "chal",
+                                     &plcf->keyring, ip, ua,
                                      p, s3 - p, mac_bytes) == NGX_OK)
         {
             matched_previous = ngx_http_pgp_ct_eq(&mac_have, &mac_want);
