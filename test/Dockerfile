@@ -18,7 +18,7 @@ ARG NGINX_VERSION=1.26.3
 ENV NGINX_VERSION=${NGINX_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev \
+        gcc make libc6-dev libssl-dev libpcre2-dev zlib1g-dev python3-minimal \
         gnupg curl ca-certificates redis-server \
     && rm -rf /var/lib/apt/lists/*
 
