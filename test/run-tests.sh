@@ -128,6 +128,11 @@ exit 0
 FAKE
 chmod +x "$WORK/fakegpg"
 
+# second keyring: contains ONLY the gpg2 key (which is NOT in pubkeys.gpg).
+# Used to check that a session minted where that key is allowed does not carry
+# over to a location whose keyring does not contain it.
+GNUPGHOME="$WORK/gpg2" gpg --export evil@example.com > "$WORK/pubkeys-b.gpg" 2>/dev/null
+
 # --- nginx config ------------------------------------------------------------
 {
     [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
@@ -243,6 +248,22 @@ http {
             pgp_session_secret $WORK/session.key;
             pgp_auth_nonce_storage none;
             pgp_gpg_path $WORK/fakegpg;
+            root $WORK/html;
+        }
+        # same session secret, DIFFERENT keyrings: a session granted under
+        # keyring B must not be accepted where only keyring A is trusted.
+        location /scope-a/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+        location /scope-b/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys-b.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
             root $WORK/html;
         }
         location /gpgpath/ {
@@ -952,6 +973,32 @@ curl -s -X POST "$base/fakefpr/?__pgp_auth=1" --data-urlencode "signed@$WORK/ff.
 grep -qi '^set-cookie:' "$WORK/hff" \
     && bad "non-hex fingerprint from gpg is rejected (would reach Set-Cookie)" \
     || ok "non-hex fingerprint from gpg is rejected"
+
+# Cross-keyring session scope: log in at /scope-b/ (whose keyring trusts only
+# the gpg2 key) and present that cookie at /scope-a/ (which trusts a different
+# key set). Both share pgp_session_secret, which is the documented way to run
+# one secret across a deployment -- so the session must still be confined to
+# the signer set it was issued under.
+curl -s "$base/scope-b/" -o "$WORK/scb" >/dev/null
+SBCH="$(challenge "$WORK/scb")"
+printf '%s' "$SBCH" | GNUPGHOME="$WORK/gpg2" gpg --clearsign --batch > "$WORK/scb.asc" 2>/dev/null
+SCOPECK=$(curl -s -o /dev/null -D - -X POST "$base/scope-b/?__pgp_auth=1" \
+          --data-urlencode "signed@$WORK/scb.asc" \
+          | grep -i '^set-cookie:' | sed 's/^[Ss]et-[Cc]ookie:[ ]*//; s/;.*//' | tr -d '\r')
+if [ -z "$SCOPECK" ]; then
+    bad "cross-keyring test setup: login at /scope-b/ did not grant a session"
+else
+    # NOTE: /scope-a/ has no file at that sub-path, so an ACCEPTED session
+    # yields 404 rather than SECRET-OK. The signal for "was it authenticated"
+    # is therefore the absence of the challenge page (which posts to
+    # ?__pgp_auth=1), not the presence of the secret body.
+    curl -s -H "Cookie: $SCOPECK" "$base/scope-a/" -o "$WORK/sca" >/dev/null
+    if grep -q '__pgp_auth' "$WORK/sca"; then
+        ok "a session is confined to the keyring it was issued under"
+    else
+        bad "session from another keyring is accepted (cross-keyring escalation)"
+    fi
+fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

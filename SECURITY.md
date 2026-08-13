@@ -70,6 +70,26 @@ Everything else (the keyring, the secret) is operator-controlled.
   deployment, turn `pgp_session_cookie_secure` off; the `__Host-` prefix is
   then dropped automatically (it requires Secure), so the cookie stays usable.
   Shorter default challenge/session lifetimes shrink the replay window.
+- **Tokens are bound to the trust domain that issued them.** A session cookie
+  and a challenge are MACed over the location's **keyring path** as well as the
+  secret, so a token issued where one signer set is trusted is not accepted
+  where a different one is. This matters because sharing a single
+  `pgp_session_secret` across a deployment is the documented setup, and a
+  session is validated on later requests by MAC, expiry and revocation alone —
+  the keyring is consulted at login, not afterwards. Without this binding, a
+  configuration such as
+
+  ```nginx
+  location /partners/ { pgp_keyring partners.gpg; pgp_session_secret /etc/nginx/pgp.key; }
+  location /admin/    { pgp_keyring admins.gpg;   pgp_session_secret /etc/nginx/pgp.key; }
+  ```
+
+  would let a partner present their session cookie at `/admin/` and be admitted
+  without ever appearing in `admins.gpg`. Locations that share **both** the
+  secret and the keyring still share sessions, which is the intended behaviour
+  for one trust domain spread over several nodes or locations. (Changing a
+  location's keyring path therefore invalidates the sessions issued under the
+  old path — the same one-time re-login as rotating the secret.)
 - **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
   and all of its live sessions without rotating the secret or reloading nginx.
   An unreadable list **fails closed** (denies) by default
