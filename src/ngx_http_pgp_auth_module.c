@@ -1318,6 +1318,7 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
      * A relative Location is resolved by the browser against the URL it actually
      * connected to, so it works behind any front end.
      */
+
     /*
      * The response that hands out the session cookie must never be stored by a
      * shared cache -- a cached copy would serve one user's credential to the
@@ -1332,6 +1333,7 @@ ngx_http_pgp_grant(ngx_http_request_t *r, ngx_http_pgp_auth_loc_conf_t *plcf,
     ngx_str_set(&cache->key, "Cache-Control");
     ngx_str_set(&cache->value, "no-store");
 
+    /* the relative Location described above */
     location = ngx_list_push(&r->headers_out.headers);
     if (location == NULL) {
         return NGX_ERROR;
@@ -2118,7 +2120,8 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * near-permanent sessions or a throttle that never forgets. 0 keeps its
      * documented meaning for pgp_session_timeout (no expiry at all).
      */
-    if (conf->session_timeout != 0 && conf->session_timeout > 2592000) {
+    /* 0 (no expiry) is below the bound, so it passes through untouched. */
+    if (conf->session_timeout > 2592000) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
             "pgp_auth: pgp_session_timeout %Ts is above the 30d maximum; "
             "clamping to 2592000s (set 0 if you deliberately want no expiry)",

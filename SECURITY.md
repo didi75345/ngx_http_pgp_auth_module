@@ -147,7 +147,8 @@ Everything else (the keyring, the secret) is operator-controlled.
   1024, and a fixed bound would leave higher-numbered fds (other client
   connections, listening sockets, log fds) reachable to the gpg subprocess.
 - **Security headers on the login page.** `X-Frame-Options: DENY`,
-  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+  `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+  frame-ancestors 'none'`,
   `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, and
   `Referrer-Policy: no-referrer` are set on the challenge/login response, so
   it can't be framed for clickjacking, MIME-sniffed, or cached.
@@ -245,6 +246,16 @@ close operational gaps.
   `pgp_auth_failure_ban_time`, and an attacker can trigger that deliberately.
   Configure realip first, or leave the throttle off in those deployments; the
   module logs this reminder at start-up whenever the throttle is enabled.
+
+  **A ban is global to the nginx instance, not per location.** Counters are
+  keyed on the client address alone and live in one shared-memory segment
+  (`pgp_auth_throttle`), so failures at `/admin/` also ban that address at
+  `/partners/`, in every server block, for `pgp_auth_failure_ban_time`. That is
+  usually what you want from an anti-probing control, but it does mean two
+  unrelated applications behind the same nginx share one throttle: a limit set
+  for a low-traffic admin area also applies to whatever else uses the module.
+  Keep the limit high enough for the most-used of them, or enable the throttle
+  in only one application per nginx instance.
 
   **Every** failed login submission counts, including the ones rejected before
   gpg is forked (a body that is not a clear-signed message, or one that could not
