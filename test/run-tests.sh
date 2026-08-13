@@ -103,6 +103,31 @@ tr '\n' '\r' < "$WORK/revoked.txt" > "$WORK/revoked-cr.txt"
 # htpasswd for the auth_basic ordering test (user pgptest / pass pw)
 printf '%s\n' 'pgptest:$apr1$abcd1234$UEURWw71lGBk.LwDG1Xr4/' > "$WORK/htpasswd"
 
+# A fake gpg used by the fingerprint-validation test below: it reports a
+# perfectly well-formed VALIDSIG whose fingerprint fields are NOT hex, and
+# writes the submitted challenge out as the "verified" plaintext. The module
+# must refuse it: a fingerprint from the subprocess reaches a Set-Cookie value,
+# the event log and the revocation check, so anything that is not hex must not
+# be accepted as an identity.
+cat > "$WORK/fakegpg" <<'FAKE'
+#!/bin/sh
+out=""; msg=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --output) out="$2"; shift 2 ;;
+        --*) shift ;;
+        *) msg="$1"; shift ;;
+    esac
+done
+# hand back the clear-signed text as the "verified" plaintext
+[ -n "$out" ] && sed -e '1,/^$/d' -e '/^-----BEGIN PGP SIGNATURE/,$d' "$msg" > "$out"
+BOGUS="ZZZZZZZZ<CR>NOT-HEX-FINGERPRINT-0000000000"
+echo "[GNUPG:] NEWSIG"
+echo "[GNUPG:] VALIDSIG $BOGUS 2026-01-01 1767225600 0 4 0 22 10 01 $BOGUS"
+exit 0
+FAKE
+chmod +x "$WORK/fakegpg"
+
 # --- nginx config ------------------------------------------------------------
 {
     [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
@@ -210,6 +235,14 @@ http {
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+        location /fakefpr/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_gpg_path $WORK/fakegpg;
             root $WORK/html;
         }
         location /gpgpath/ {
@@ -907,6 +940,18 @@ THCODE="$(thr_code)"
     || bad "throttle ban not applied (got $THCODE)"
 
 [ -f "$WORK/logs/thr-nginx.pid" ] && kill "$(cat "$WORK/logs/thr-nginx.pid")" 2>/dev/null
+
+# A VALIDSIG whose fingerprint fields are not hex must not authenticate. Both
+# the primary-key field and the older signing-key fallback are validated, so a
+# non-hex identity can never reach the session cookie or the event log.
+curl -s "$base/fakefpr/" -o "$WORK/ffp" >/dev/null
+FFCH="$(challenge "$WORK/ffp")"
+printf '%s' "$FFCH" | gpg --clearsign --batch > "$WORK/ff.asc" 2>/dev/null
+curl -s -X POST "$base/fakefpr/?__pgp_auth=1" --data-urlencode "signed@$WORK/ff.asc" \
+     -D "$WORK/hff" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hff" \
+    && bad "non-hex fingerprint from gpg is rejected (would reach Set-Cookie)" \
+    || ok "non-hex fingerprint from gpg is rejected"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

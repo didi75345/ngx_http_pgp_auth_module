@@ -56,6 +56,27 @@ fz_strncmp(const char *a, const char *b, size_t n)
  * fuzzer's input into a NUL-terminated local buffer first, exactly like the
  * real function does with parsebuf/out.
  */
+/* mirror of ngx_http_pgp_fpr_is_hex() in src/ngx_http_pgp_auth_gpg.c */
+static int
+fz_fpr_is_hex(const char *s, size_t len)
+{
+    size_t i;
+
+    if (len < 32) {
+        return 0;
+    }
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char) s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+              || (c >= 'A' && c <= 'F')))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
 static void
 ngx_pgp_fuzz_parse_status(char *buf, fuzz_result_t *res)
 {
@@ -76,7 +97,7 @@ ngx_pgp_fuzz_parse_status(char *buf, fuzz_result_t *res)
 
         if (fz_strncmp(p, "VALIDSIG ", 9) == 0) {
             char    *q, *tok;
-            size_t   n, i;
+            size_t   n;
 
             p += 9;
 
@@ -97,16 +118,7 @@ ngx_pgp_fuzz_parse_status(char *buf, fuzz_result_t *res)
             }
             res->fpr[n] = '\0';
 
-            for (i = 0; i < n; i++) {
-                unsigned char c = (unsigned char) res->fpr[i];
-                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
-                      || (c >= 'A' && c <= 'F')))
-                {
-                    break;
-                }
-            }
-
-            if (n >= 32 && i == n) {
+            if (fz_fpr_is_hex(res->fpr, n)) {
                 res->fpr_len = n;
                 good = 1;
             } else {
@@ -118,9 +130,12 @@ ngx_pgp_fuzz_parse_status(char *buf, fuzz_result_t *res)
                     n++;
                 }
                 res->fpr[n] = '\0';
-                res->fpr_len = n;
-                if (n >= 32) {
+
+                if (fz_fpr_is_hex(res->fpr, n)) {
+                    res->fpr_len = n;
                     good = 1;
+                } else {
+                    res->fpr_len = 0;
                 }
             }
 

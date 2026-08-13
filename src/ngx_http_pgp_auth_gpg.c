@@ -106,6 +106,35 @@ ngx_http_pgp_gpg_cleanup(const char *home, const char *msgpath)
 }
 
 
+/*
+ * A fingerprint taken from gpg's status output ends up in a Set-Cookie header
+ * value, in the structured event log, and in the revocation comparison, so it
+ * must be exactly what gpg is documented to emit: hex, at least 32 characters.
+ * This module's rule is that the subprocess's output is not trusted, and this
+ * is the one place a byte from it would reach a response header -- a stray
+ * carriage return here would be header injection, since the token scan below
+ * stops only at a space or NUL.
+ */
+static ngx_int_t
+ngx_http_pgp_fpr_is_hex(u_char *s, size_t len)
+{
+    size_t  i;
+
+    if (len < 32) {
+        return 0;
+    }
+    for (i = 0; i < len; i++) {
+        u_char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+              || (c >= 'A' && c <= 'F')))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
 ngx_int_t
 ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
     ngx_str_t *keyring, u_char *msg, size_t msg_len, ngx_msec_t timeout_ms,
@@ -462,7 +491,6 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
 
         if (ngx_strncmp(p, "VALIDSIG ", 9) == 0) {
             char    *q, *tok;
-            size_t   i;
 
             p += 9;
 
@@ -495,23 +523,15 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
             }
             res->fpr[n] = '\0';
 
-            /* the last field must look like a fingerprint (hex, >= 32) */
-            for (i = 0; i < (size_t) n; i++) {
-                u_char c = res->fpr[i];
-                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
-                      || (c >= 'A' && c <= 'F')))
-                {
-                    break;
-                }
-            }
-
-            if (n >= 32 && i == (size_t) n) {
+            if (ngx_http_pgp_fpr_is_hex(res->fpr, (size_t) n)) {
                 res->fpr_len = (size_t) n;      /* primary key fingerprint */
                 good = 1;
             } else {
                 /*
                  * No usable primary-key-fpr (e.g. a very old gpg whose
                  * VALIDSIG omits it) -- fall back to field 1 (signing key).
+                 * Validated the same way: an unvalidated fingerprint would
+                 * reach a Set-Cookie value, so both paths apply one rule.
                  */
                 n = 0;
                 while (p[n] != '\0' && p[n] != ' '
@@ -521,9 +541,12 @@ ngx_http_pgp_gpg_verify(ngx_log_t *log, ngx_str_t *gpg_path,
                     n++;
                 }
                 res->fpr[n] = '\0';
-                res->fpr_len = (size_t) n;
-                if (n >= 32) {
+
+                if (ngx_http_pgp_fpr_is_hex(res->fpr, (size_t) n)) {
+                    res->fpr_len = (size_t) n;
                     good = 1;
+                } else {
+                    res->fpr_len = 0;           /* not a usable fingerprint */
                 }
             }
 
