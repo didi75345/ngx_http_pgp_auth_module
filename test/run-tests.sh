@@ -14,6 +14,7 @@ PORT="${PORT:-8899}"
 WORK="$(mktemp -d)"
 PASS=0
 FAIL=0
+SKIP=0
 
 cleanup() {
     rc=$?
@@ -667,7 +668,7 @@ EOF
         || bad "HTTP/2 login (got '$hcode')"
     [ -f "$WORK/logs/h2.pid" ] && kill "$(cat "$WORK/logs/h2.pid")" 2>/dev/null
 else
-    echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
+    skip "HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
 
 # SameSite: the /strict/ location sets pgp_session_cookie_samesite Strict, so a
@@ -879,7 +880,7 @@ EOF
     [ -f "$WORK/logs/redis-nginx.pid" ] && kill "$(cat "$WORK/logs/redis-nginx.pid")" 2>/dev/null
     kill "$REDISPID" 2>/dev/null || true
 else
-    echo "  SKIP  redis backend + AUTH tests (redis-server not installed)"
+    skip "redis backend + AUTH tests (redis-server not installed)"
 fi
 
 # --- session-secret rotation (closes the gap noted in the addendum) ----------
@@ -1046,7 +1047,7 @@ PYPIPE
         && ok "request body is discarded (no pipelined second response)" \
         || bad "unread body parsed as a pipelined request ($NRESP responses on one connection)"
 else
-    echo "  SKIP  pipelining check (python3 not available)"
+    skip "pipelining check (python3 not available)"
 fi
 
 # An oversized revocation list must be refused and must fail closed.
@@ -1074,5 +1075,5 @@ else
 fi
 
 echo
-echo "RESULT: $PASS passed, $FAIL failed"
+echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
