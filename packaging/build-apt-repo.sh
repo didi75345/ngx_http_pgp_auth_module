@@ -28,13 +28,24 @@ SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 mkdir -p "$OUTDIR"
 
+# The private key is handed over as a 0600 file on a private mount rather than
+# in the container's environment: an environment variable is readable through
+# `docker inspect` and /proc/<pid>/environ for the life of the container.
+KEYDIR=$(mktemp -d)
+chmod 700 "$KEYDIR"
+trap 'rm -rf "$KEYDIR"' EXIT INT TERM
+if [ -n "${APT_GPG_PRIVATE_KEY:-}" ]; then
+    printf '%s' "$APT_GPG_PRIVATE_KEY" > "$KEYDIR/private.asc"
+    chmod 600 "$KEYDIR/private.asc"
+fi
+
 docker run --rm \
     -v "$DISTDIR":/dist:ro \
     -v "$OUTDIR":/out \
     -v "$SRCDIR":/src:ro \
     -e "ORIGIN=$ORIGIN" -e "LABEL=$LABEL" -e "ARCH=$ARCH" \
-    -e "APT_GPG_PRIVATE_KEY=${APT_GPG_PRIVATE_KEY:-}" \
     -e "APT_GPG_PASSPHRASE=${APT_GPG_PASSPHRASE:-}" \
+    -v "$KEYDIR":/keys:ro \
     debian:trixie-slim \
     bash -eu -c '
         export DEBIAN_FRONTEND=noninteractive
@@ -66,13 +77,27 @@ docker run --rm \
                 -o "APT::FTPArchive::Release::Architectures=$ARCH" \
                 release "dists/$rel" > "dists/$rel/Release"
 
+            # Valid-Until bounds how long this signed metadata stays acceptable.
+            # Without it a signed Release never expires, so anyone able to serve
+            # an old copy (a stale mirror, a cache, a MITM on the transport) can
+            # pin clients to an outdated package set indefinitely and apt has no
+            # way to notice. Re-publish before it lapses.
+            # It is written here rather than through apt-ftparchive because that
+            # tool silently ignores its Release::Valid-Until option (verified:
+            # the emitted file contained Date but no Valid-Until). The Release
+            # checksums cover the Packages indices, not Release itself, and the
+            # signature is made afterwards, so editing it here is safe.
+            VALID_UNTIL=$(date -u -d "+${APT_REPO_VALID_DAYS:-30} days" \
+                          "+%a, %d %b %Y %H:%M:%S UTC")
+            sed -i "/^Date:/a Valid-Until: $VALID_UNTIL" "dists/$rel/Release"
+
             echo "indexed $rel: $(ls pool/$rel | tr "\n" " ")"
         done
 
         # sign, if a key was supplied
-        if [ -n "${APT_GPG_PRIVATE_KEY:-}" ]; then
+        if [ -s /keys/private.asc ]; then
             export GNUPGHOME=/tmp/gpg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-            printf "%s" "$APT_GPG_PRIVATE_KEY" | gpg --batch --import 2>/dev/null
+            gpg --batch --import /keys/private.asc 2>/dev/null
             KEYID=$(gpg --list-secret-keys --with-colons | awk -F: "/^sec/{print \$5; exit}")
             [ -n "$KEYID" ] || { echo "no secret key imported" >&2; exit 1; }
 
@@ -110,7 +135,7 @@ docker run --rm \
             gpg --export "$KEYID" > pgp-auth-archive-keyring.gpg
             echo "signed with $KEYID"
         else
-            echo "WARNING: no APT_GPG_PRIVATE_KEY -- repository is UNSIGNED"
+            echo "WARNING: no signing key supplied -- repository is UNSIGNED"
         fi
 
         # a landing page with copy-pasteable install instructions
