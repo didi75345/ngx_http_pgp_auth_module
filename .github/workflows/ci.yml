@@ -90,11 +90,16 @@ jobs:
     container:
       image: debian:trixie-slim
     steps:
-      - name: Install clang
+      - name: Install clang and the sanitizer runtimes
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends clang
+          # clang alone does not pull in compiler-rt, so -fsanitize=fuzzer,address
+          # fails at link time with "cannot find libclang_rt.fuzzer.a".
+          # The runtime package is versioned after the clang major version.
+          CLANG_MAJOR=$(clang --version | sed -n "s/.*version \([0-9]*\).*/\1/p" | head -1)
+          apt-get install -y -qq --no-install-recommends "libclang-rt-${CLANG_MAJOR}-dev"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Build the harnesses
         run: sh test/fuzz/build.sh
