@@ -16,11 +16,19 @@ permissions:
   contents: read
 
 # F-007: two runs must not overlap. build/install-test racing is harmless, but
-# publish signs and deploys -- two of them interleaving could put a mixture of
+# signing and deploying is not -- two of them interleaving could put a mixture of
 # two runs' artifacts on Pages. Queue instead, and never cancel in flight: a
 # signing/deploy run killed halfway is worse than one that waits.
+#
+# Keying the group on github.ref only serialises repeated runs of the SAME ref;
+# two `v*` tags pushed close together -- the case this finding described -- would
+# still run at the same time. So every publish-capable run shares one
+# ref-independent group, and everything else stays keyed per ref.
 concurrency:
-  group: packages-${{ github.ref }}
+  group: >-
+    ${{ (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        && 'packages-publish'
+        || format('packages-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
@@ -225,7 +233,8 @@ jobs:
     # packaging/README.md, "Hardening the release path".
     environment: release
     permissions:
-      contents: read  # this job publishes nothing; it only signs
+      contents: read       # this job publishes nothing; it only signs
+      attestations: read   # verify each .deb's provenance before signing it
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
@@ -260,7 +269,32 @@ jobs:
               exit 1
             fi
             echo "=== $rel ==="
+            # `sha256sum -c` proves every LISTED file still matches. It says
+            # nothing about a file that was ADDED to the artifact after the
+            # manifest was written -- that one would be signed and published
+            # unnoticed. So compare the directory listing against the manifest
+            # as well, and fail on any difference in either direction.
             ( cd "$rel" && sha256sum -c SHA256SUMS )
+            ( cd "$rel" && ls -1 ./*.deb | sort > /tmp/present.txt )
+            awk '{ print $2 }' "$rel/SHA256SUMS" | sort > /tmp/listed.txt
+            if ! diff -u /tmp/listed.txt /tmp/present.txt; then
+              echo "::error::$rel contains packages the build job did not record"
+              echo "(or is missing one) -- refusing to sign."
+              exit 1
+            fi
+          done
+
+      - name: Verify the build provenance attestation before signing anything
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # The attestation is only worth anything if something checks it. Each
+          # .deb must carry a provenance statement from THIS repository before it
+          # is allowed anywhere near the signing key.
+          for deb in dist/*/*.deb; do
+            echo "=== $deb ==="
+            gh attestation verify "$deb" --repo "$GITHUB_REPOSITORY"
           done
 
       - name: Build the signed repository

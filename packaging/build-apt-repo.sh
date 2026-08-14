@@ -49,6 +49,7 @@ docker run --rm \
     -v "$OUTDIR":/out \
     -v "$SRCDIR":/src:ro \
     -e "ORIGIN=$ORIGIN" -e "LABEL=$LABEL" -e "ARCH=$ARCH" \
+    -e "APT_REPO_VALID_DAYS=${APT_REPO_VALID_DAYS:-30}" \
     -v "$KEYDIR":/keys:ro \
     debian:trixie-slim \
     bash -eu -c '
