@@ -120,9 +120,13 @@ Packages are published for Debian **Bookworm** and **Trixie** (**amd64**), built
 against each release's own nginx:
 
 ```sh
-# 1. trust the archive key
+# 1. fetch the archive key and check it BEFORE trusting it
 curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive-keyring.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg
+  -o /tmp/pgp-auth-archive-keyring.asc
+gpg --show-keys --with-fingerprint /tmp/pgp-auth-archive-keyring.asc
+# compare against the fingerprint published on the repository page, then:
+sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg \
+  /tmp/pgp-auth-archive-keyring.asc
 
 # 2. add the repository (replace $(lsb_release -cs) if you prefer to hardcode)
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
@@ -133,6 +137,17 @@ https://didi75345.github.io/ngx_http_pgp_auth_module $(lsb_release -cs) main" \
 sudo apt update && sudo apt install libnginx-mod-http-pgp-auth
 sudo systemctl reload nginx
 ```
+
+**What that fingerprint check does and does not do.** The key, its fingerprint
+and the packages are all served from the same GitHub Pages site, so comparing
+them catches tampering in transit but not a compromise of the repository or its
+publishing pipeline — an attacker holding those controls both sides of the
+comparison. This is trust-on-first-use, and the check makes it explicit rather
+than silent. An anchor that actually closes the gap has to come from somewhere
+the site's owner does not control alone: a fingerprint obtained out of band, or
+published over WKD on an independently-controlled domain. See
+[packaging/README.md](packaging/README.md) for the release-path hardening this
+project recommends to whoever operates the repository.
 
 The package installs the module to `/usr/lib/nginx/modules/` and enables it via
 `/etc/nginx/modules-enabled/50-mod-http-pgp-auth.conf`, so no `load_module`

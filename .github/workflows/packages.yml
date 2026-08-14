@@ -15,16 +15,37 @@ on:
 permissions:
   contents: read
 
+# F-007: two runs must not overlap. build/install-test racing is harmless, but
+# publish signs and deploys -- two of them interleaving could put a mixture of
+# two runs' artifacts on Pages. Queue instead, and never cancel in flight: a
+# signing/deploy run killed halfway is worse than one that waits.
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: build .deb (${{ matrix.release }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read  # checkout only
+      # Required by actions/attest-build-provenance; scoped to this job only.
+      id-token: write  # OIDC token for provenance attestation
+      attestations: write  # write the attestation for each built .deb
     strategy:
       fail-fast: false
       matrix:
-        release: [ bookworm, trixie ]
+        # Pinned by digest rather than by tag: `debian:trixie-slim` moves, so the
+        # toolchain that produces (and later signs) the packages would differ
+        # between runs and the build would not be reproducible. Refresh these
+        # deliberately when picking up base-image updates.
+        include:
+          - release: bookworm
+            image: debian@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+          - release: trixie
+            image: debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
     container:
-      image: debian:${{ matrix.release }}-slim
+      image: ${{ matrix.image }}
     steps:
       - name: Install build dependencies
         run: |
@@ -35,9 +56,19 @@ jobs:
             nginx-dev libssl-dev libpcre2-dev zlib1g-dev lintian
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          # Nothing here needs git authentication after the checkout, and the
+          # default leaves the job's token in .git/config where anything else
+          # running in the job can read it.
+          persist-credentials: false
 
       - name: Build the package
         env:
+          # Passed as an environment variable rather than expanded into the
+          # script text: a `${{ }}` expansion is substituted before the shell
+          # ever sees it, which is the shape of a template-injection bug even
+          # when the value (here a matrix entry) is not attacker-controlled.
+          RELEASE: ${{ matrix.release }}
           # Without these, dch stamps the changelog entry with root@<container-id>,
           # which ships in the package and fails lintian
           # (bogus-mail-host-in-debian-changelog). packaging/build-deb.sh already
@@ -47,48 +78,86 @@ jobs:
           DEBFULLNAME: didi75345
         run: |
           # Version the package per release so one repository can serve both.
-          dch --local "~${{ matrix.release }}" --distribution "${{ matrix.release }}" \
-              "Build for Debian ${{ matrix.release }}." || true
+          dch --local "~$RELEASE" --distribution "$RELEASE" \
+              "Build for Debian $RELEASE." || true
           dpkg-buildpackage -us -uc -b
-          mkdir -p dist/${{ matrix.release }}
-          cp ../*.deb dist/${{ matrix.release }}/
+          mkdir -p "dist/$RELEASE"
+          cp ../*.deb "dist/$RELEASE/"
 
       - name: Lintian
         # Enforced, not advisory: the packages are currently lintian-clean on
         # both releases, so a new error means a real packaging regression.
         # Errors fail the build; warnings/info are shown but tolerated, since a
         # lintian upgrade can introduce new lower-severity tags on its own.
-        run: lintian --tag-display-limit 0 --fail-on error dist/${{ matrix.release }}/*.deb
+        env:
+          RELEASE: ${{ matrix.release }}
+        run: lintian --tag-display-limit 0 --fail-on error "dist/$RELEASE"/*.deb
 
       - name: Show package metadata (ABI dependency must be present)
+        env:
+          RELEASE: ${{ matrix.release }}
         run: |
-          for d in dist/${{ matrix.release }}/*.deb; do
+          for d in "dist/$RELEASE"/*.deb; do
             echo "=== $d ==="
             dpkg-deb -I "$d" | sed -n '/Package:/,/Description:/p'
             dpkg-deb -c "$d"
           done
           # Check the module package specifically -- the build also produces a
           # -dbgsym package, which carries no nginx-abi dependency.
-          mod_deb=$(ls dist/${{ matrix.release }}/libnginx-mod-http-pgp-auth_*.deb | head -1)
+          mod_deb=$(ls "dist/$RELEASE"/libnginx-mod-http-pgp-auth_*.deb | head -1)
           echo "checking $mod_deb"
           dpkg-deb -I "$mod_deb" | grep -q 'nginx-abi-' \
             || { echo "::error::module package has no nginx-abi dependency"; exit 1; }
 
+      - name: Record a digest manifest of the built packages
+        # Travels with the artifact so the signing job can confirm it is signing
+        # the bytes this job produced. This catches a mishandled or corrupted
+        # handoff, not a determined adversary: the manifest moves through the
+        # same artifact channel, so anything able to swap the .deb between jobs
+        # can rewrite the manifest with it. The provenance attestation below is
+        # the control that binds the artifact to this run.
+        env:
+          RELEASE: ${{ matrix.release }}
+        run: |
+          cd "dist/$RELEASE"
+          sha256sum ./*.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        # Not on pull_request: fork runs are not granted id-token, and a PR build
+        # is not a release artifact. Binds each .deb to this workflow run and
+        # commit; it proves which run produced the package, not that the run's
+        # own inputs were trustworthy.
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: dist/${{ matrix.release }}/*.deb
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: deb-${{ matrix.release }}
-          path: dist/${{ matrix.release }}/*.deb
+          path: |
+            dist/${{ matrix.release }}/*.deb
+            dist/${{ matrix.release }}/SHA256SUMS
 
   install-test:
     name: install + e2e on the installed package (${{ matrix.release }})
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        release: [ bookworm, trixie ]
+        # Pinned by digest rather than by tag: `debian:trixie-slim` moves, so the
+        # toolchain that produces (and later signs) the packages would differ
+        # between runs and the build would not be reproducible. Refresh these
+        # deliberately when picking up base-image updates.
+        include:
+          - release: bookworm
+            image: debian@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+          - release: trixie
+            image: debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
     container:
-      image: debian:${{ matrix.release }}-slim
+      image: ${{ matrix.image }}
     steps:
       - name: Install runtime dependencies
         run: |
@@ -101,6 +170,11 @@ jobs:
             nginx gnupg curl ca-certificates redis-server procps python3-minimal
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          # Nothing here needs git authentication after the checkout, and the
+          # default leaves the job's token in .git/config where anything else
+          # running in the job can read it.
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -134,15 +208,31 @@ jobs:
             || { echo "::error::module still enabled after removal"; exit 1; }
           nginx -t
 
-  publish:
-    name: publish signed APT repository
+  # Signing and deploying are two jobs on purpose (F-001/F-003): `sign` holds the
+  # signing key and runs no third-party action; `deploy` runs the third-party
+  # Pages action with a write-scoped token and no signing material. A compromise
+  # of either one no longer reaches the other's secret.
+  sign:
+    name: sign the APT repository
     needs: install-test
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # F-001: the signing secret is scoped to this environment. THIS ALONE IS NOT
+    # A GATE -- it only becomes one once the repository owner adds required
+    # reviewers to the `release` environment (Settings -> Environments -> release)
+    # and protects `v*` tags (Settings -> Rules). Without those, authority to ship
+    # a signed package is still just repository write access. See
+    # packaging/README.md, "Hardening the release path".
+    environment: release
     permissions:
-      contents: write
+      contents: read  # this job publishes nothing; it only signs
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          # Nothing here needs git authentication after the checkout, and the
+          # default leaves the job's token in .git/config where anything else
+          # running in the job can read it.
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -155,9 +245,23 @@ jobs:
           # expects dist/<release>/*.deb
           for d in dist/deb-*; do
             rel="${d#dist/deb-}"
-            mkdir -p "dist/$rel" && mv "$d"/*.deb "dist/$rel/" && rmdir "$d"
+            mkdir -p "dist/$rel" && mv "$d"/* "dist/$rel/" && rmdir "$d"
           done
           ls -R dist
+
+      - name: Verify the packages against the manifest recorded at build time
+        run: |
+          set -eu
+          for reldir in dist/*/; do
+            rel="${reldir%/}"
+            if [ ! -f "$rel/SHA256SUMS" ]; then
+              echo "::error::$rel has no SHA256SUMS -- refusing to sign packages"
+              echo "that cannot be matched to the build job that produced them."
+              exit 1
+            fi
+            echo "=== $rel ==="
+            ( cd "$rel" && sha256sum -c SHA256SUMS )
+          done
 
       - name: Build the signed repository
         env:
@@ -168,15 +272,42 @@ jobs:
             echo "::warning::APT_GPG_PRIVATE_KEY secret is not set -- the repository would be unsigned; skipping publish."
             exit 0
           fi
+          # The manifest was the handoff check; it is not part of the repository.
+          rm -f dist/*/SHA256SUMS
           sh packaging/build-apt-repo.sh "$PWD/dist" "$PWD/public"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: hashFiles('public/dists/**') != ''
+        with:
+          name: signed-repository
+          path: public
+
+  deploy:
+    name: deploy the signed repository to Pages
+    needs: sign
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write  # push the built repository to the gh-pages branch
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: signed-repository
+          path: public
 
       - name: Deploy to GitHub Pages
         if: hashFiles('public/dists/**') != ''
+        # Third-party and flagged by poutine as an unverified-creator action. Kept
+        # deliberately: it is pinned to a full commit SHA, it now runs in a job
+        # that holds no signing key, and its only privilege is writing the Pages
+        # branch. Hand-rolling the push would move the repository token into a
+        # credential file or argv, which is the exposure this pipeline just spent
+        # effort removing elsewhere.
         uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453  # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./public
-          # false: the job rebuilds the whole repository from the artifacts of
-          # this run, so keeping old files would leave withdrawn packages
+          # false: the run rebuilds the whole repository from this run's
+          # artifacts, so keeping old files would leave withdrawn packages
           # fetchable forever alongside a Release that no longer indexes them.
           keep_files: false

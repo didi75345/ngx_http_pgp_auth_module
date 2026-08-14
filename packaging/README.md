@@ -97,3 +97,56 @@ The workflow does more than build:
    the package and confirms nginx still starts and the symlink is gone.
 3. **publish** — only on a tag or manual run, and only if a signing key is
    configured.
+
+## Hardening the release path
+
+Everything below lives in repository settings or in how the signing key itself is
+kept — none of it can be enforced from a file in this repository, so it is listed
+here as the operator's checklist rather than silently assumed.
+
+**1. Make the environment gate real.** The `publish` job declares
+`environment: release`, but an environment with no rules is only a label. In
+*Settings → Environments → release*, add required reviewers and scope
+`APT_GPG_PRIVATE_KEY` / `APT_GPG_PASSPHRASE` to that environment instead of the
+repository. In *Settings → Rules*, protect the `v*` tag pattern. Until both are
+done, the authority to publish a signed package is exactly "repository write
+access" — no separate compromise needed.
+
+**2. Never put the primary key in CI.** Keep the primary key offline (hardware
+token or an airgapped machine) and give CI only a **signing subkey**, with a
+revocation certificate for that subkey generated in advance and stored offline.
+Users then anchor on the primary's fingerprint, so a compromised CI costs a
+revocable subkey rather than the identity every apt client already trusts:
+
+```sh
+gpg --quick-add-key <PRIMARY-FPR> rsa4096 sign 2y      # create the signing subkey
+gpg --export-secret-subkeys --armor <SUBKEY-ID>!  > ci-subkey.asc   # note the '!'
+gpg --output subkey-revocation.asc --gen-revoke <SUBKEY-ID>
+```
+
+Put `ci-subkey.asc` in `APT_GPG_PRIVATE_KEY`; keep the primary and the revocation
+certificate off the machine that builds. Rotating the subkey then does not force
+a single user to re-import anything.
+
+**3. Give users an anchor you do not serve yourself.** The published fingerprint
+(`pgp-auth-archive-keyring.fingerprint`, also rendered into the landing page)
+comes from the same origin as the packages, so it makes trust-on-first-use
+explicit — it does not remove it. If a domain is available whose DNS and hosting
+are controlled independently of the GitHub account, publish the primary key over
+WKD there; a keyserver is worth doing as redundancy, not as a replacement. If you
+stop short of that, leave the install docs saying plainly that trust is
+first-use only, as they do today.
+
+**4. What the pipeline already does.** Actions and base images are pinned by
+digest, the checkout token is not persisted into `.git/config`, the runner is a
+pinned Ubuntu version, `concurrency` keeps two publishes from interleaving, the
+build job attests provenance for each `.deb`, and `publish` verifies the packages
+against the digest manifest recorded at build time before signing anything.
+
+**5. What none of it covers.** Provenance and the manifest bind the artifact to
+the run that produced it; they say nothing about whether that run's own inputs
+were trustworthy. A compromised build dependency pulled from Debian at build time
+would be attested and signed exactly like a good one. Closing that requires
+reproducible builds with independent rebuilders, which is out of proportion to a
+project this size — it is named here so it is not mistaken for something the
+controls above already handle.
