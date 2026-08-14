@@ -66,15 +66,26 @@ protected, `APT_GPG_PASSPHRASE`. The script then writes `InRelease` and
 key the tree is still assembled but **unsigned**, which apt only accepts with
 `[trusted=yes]` — acceptable for a local smoke test, not for publication.
 
-Generating a dedicated archive key:
+Generating a dedicated archive key. **What goes into CI is a signing subkey,
+never the primary key** — see "Hardening the release path" below for why, and for
+the revocation certificate that makes the subkey recoverable:
 
 ```sh
-gpg --batch --quick-generate-key "ngx_http_pgp_auth archive" ed25519 sign never
-gpg --armor --export-secret-keys <fpr>   # -> APT_GPG_PRIVATE_KEY secret
+# 1. primary key -- stays offline, never leaves this machine
+gpg --batch --quick-generate-key "ngx_http_pgp_auth archive" ed25519 cert never
+
+# 2. a signing subkey, which is the only part CI ever sees
+gpg --quick-add-key <PRIMARY-FPR> ed25519 sign 2y
+gpg --export-secret-subkeys --armor <SUBKEY-ID>!   # -> APT_GPG_PRIVATE_KEY
 ```
 
-Keep the private key out of the repository. In CI it is read from the
-`APT_GPG_PRIVATE_KEY` / `APT_GPG_PASSPHRASE` GitHub Actions secrets.
+Note the trailing `!` — without it gpg exports every subkey. Users anchor on the
+**primary** fingerprint, which is what the repository publishes, so rotating the
+signing subkey never asks a single user to re-import anything.
+
+For a purely local smoke test a single key is fine; for anything published, use
+the split above. Keep the private material out of the repository — in CI it is
+read from the `APT_GPG_PRIVATE_KEY` / `APT_GPG_PASSPHRASE` GitHub Actions secrets.
 
 ## Publishing
 
@@ -95,8 +106,12 @@ The workflow does more than build:
    modules/...`). This is the check that matters: it proves the shipped package
    actually authenticates, not merely that the source compiles. It then removes
    the package and confirms nginx still starts and the symlink is gone.
-3. **publish** — only on a tag or manual run, and only if a signing key is
-   configured.
+3. **sign** — only on a tag or manual run, and only if a signing key is
+   configured. Verifies each package's provenance attestation and its digest
+   manifest, then builds and signs the repository. Holds the signing key; has no
+   write access to the repository and runs no third-party action.
+4. **deploy** — publishes what `sign` produced to GitHub Pages. Holds the write
+   token and the third-party Pages action, and no signing material.
 
 ## Hardening the release path
 
@@ -104,7 +119,7 @@ Everything below lives in repository settings or in how the signing key itself i
 kept — none of it can be enforced from a file in this repository, so it is listed
 here as the operator's checklist rather than silently assumed.
 
-**1. Make the environment gate real.** The `publish` job declares
+**1. Make the environment gate real.** The `sign` job declares
 `environment: release`, but an environment with no rules is only a label. In
 *Settings → Environments → release*, add required reviewers and scope
 `APT_GPG_PRIVATE_KEY` / `APT_GPG_PASSPHRASE` to that environment instead of the
@@ -139,9 +154,12 @@ first-use only, as they do today.
 
 **4. What the pipeline already does.** Actions and base images are pinned by
 digest, the checkout token is not persisted into `.git/config`, the runner is a
-pinned Ubuntu version, `concurrency` keeps two publishes from interleaving, the
-build job attests provenance for each `.deb`, and `publish` verifies the packages
-against the digest manifest recorded at build time before signing anything.
+pinned Ubuntu version, and `concurrency` puts every publish-capable run into one
+group so two `v*` tags cannot sign and deploy at the same time. The `build` job
+attests provenance for each `.deb`; the `sign` job verifies that attestation with
+`gh attestation verify`, checks the packages against the digest manifest recorded
+at build time, and fails if the artifact contains any package the manifest does
+not list — all before the signing key is used.
 
 **5. What none of it covers.** Provenance and the manifest bind the artifact to
 the run that produced it; they say nothing about whether that run's own inputs

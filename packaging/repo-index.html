@@ -25,15 +25,17 @@
 
 <h2>Install</h2>
 <pre><code># fetch the archive key
+key=$(mktemp)            # not a fixed path: a predictable name can be swapped
+                         # between the check below and the import
 curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive-keyring.asc \
-  -o /tmp/pgp-auth-archive-keyring.asc
+  -o "$key"
 
 # check it BEFORE trusting it -- the fingerprint must match
-gpg --show-keys --with-fingerprint /tmp/pgp-auth-archive-keyring.asc
+gpg --show-keys --with-fingerprint "$key"
 #   expected: @@FINGERPRINT@@
 
-sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg \
-  /tmp/pgp-auth-archive-keyring.asc
+sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg &lt; "$key"
+rm -f "$key"
 
 # add the repository
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \

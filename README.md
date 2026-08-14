@@ -121,12 +121,14 @@ against each release's own nginx:
 
 ```sh
 # 1. fetch the archive key and check it BEFORE trusting it
+key=$(mktemp)            # not a fixed path: on a shared host a predictable
+                         # name can be swapped between the check and the import
 curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive-keyring.asc \
-  -o /tmp/pgp-auth-archive-keyring.asc
-gpg --show-keys --with-fingerprint /tmp/pgp-auth-archive-keyring.asc
+  -o "$key"
+gpg --show-keys --with-fingerprint "$key"
 # compare against the fingerprint published on the repository page, then:
-sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg \
-  /tmp/pgp-auth-archive-keyring.asc
+sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg < "$key"
+rm -f "$key"
 
 # 2. add the repository (replace $(lsb_release -cs) if you prefer to hardcode)
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
