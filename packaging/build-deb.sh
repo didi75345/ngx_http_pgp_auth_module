@@ -40,7 +40,10 @@ docker run --rm \
         dpkg-buildpackage -us -uc -b
         cp -v ../*.deb /out/
         echo "=== lintian ==="
-        lintian --tag-display-limit 0 --fail-on error /out/*.deb || true
+        # Enforced, not advisory -- CI does the same. An error here is a real
+        # packaging regression, and `|| true` is how the published packages once
+        # shipped with a bogus maintainer address without anyone noticing.
+        lintian --tag-display-limit 0 --fail-on error /out/*.deb
     '
 echo "built into: $OUTDIR"
 ls -1 "$OUTDIR"

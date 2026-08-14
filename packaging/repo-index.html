@@ -24,9 +24,16 @@
 <p class="sub">APT repository &mdash; PGP-signature authentication for nginx.</p>
 
 <h2>Install</h2>
-<pre><code># trust the archive key
+<pre><code># fetch the archive key
 curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/pgp-auth-archive-keyring.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg
+  -o /tmp/pgp-auth-archive-keyring.asc
+
+# check it BEFORE trusting it -- the fingerprint must match
+gpg --show-keys --with-fingerprint /tmp/pgp-auth-archive-keyring.asc
+#   expected: @@FINGERPRINT@@
+
+sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg \
+  /tmp/pgp-auth-archive-keyring.asc
 
 # add the repository
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
@@ -36,6 +43,14 @@ https://didi75345.github.io/ngx_http_pgp_auth_module $(lsb_release -cs) main" \
 # install
 sudo apt update &amp;&amp; sudo apt install libnginx-mod-http-pgp-auth
 sudo systemctl reload nginx</code></pre>
+
+<p class="sub"><b>About that fingerprint:</b> it is published on this page, which
+is served from the same place as the key and the packages. Comparing against it
+catches tampering in transit, but not a compromise of this repository or its
+publishing pipeline &mdash; in that case an attacker controls the key and the
+expected fingerprint alike. This is trust-on-first-use, stated plainly rather
+than dressed up. If you need a real anchor, obtain the fingerprint from a channel
+the maintainer controls independently of this site before you import the key.</p>
 
 <h2>What you get</h2>
 <table>

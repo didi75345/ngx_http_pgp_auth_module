@@ -137,13 +137,28 @@ docker run --rm \
             # public key for clients (both armoured and dearmoured forms)
             gpg --armor --export "$KEYID" > pgp-auth-archive-keyring.asc
             gpg --export "$KEYID" > pgp-auth-archive-keyring.gpg
-            echo "signed with $KEYID"
+
+            # The fingerprint is published as a file and rendered into the
+            # landing page so a user can check the key they fetched instead of
+            # importing it blind. It is served from the same origin as the key
+            # itself, so this makes trust-on-first-use explicit rather than
+            # eliminating it -- an out-of-band anchor is what actually closes it.
+            # NOTE: no single quotes anywhere in here -- this whole block runs
+            # inside a single-quoted `bash -c` string, so an awk or printf using
+            # them would silently terminate it.
+            FPR=$(gpg --list-keys --with-colons "$KEYID" \
+                  | grep "^fpr:" | cut -d: -f10 | head -1)
+            echo "$FPR" > pgp-auth-archive-keyring.fingerprint
+            echo "signed with $KEYID (fingerprint $FPR)"
         else
+            FPR="(repository is UNSIGNED -- no key)"
             echo "WARNING: no signing key supplied -- repository is UNSIGNED"
         fi
 
         # a landing page with copy-pasteable install instructions
-        cp -f /src/packaging/repo-index.html index.html 2>/dev/null || true
+        sed "s|@@FINGERPRINT@@|$FPR|g" /src/packaging/repo-index.html \
+            > index.html 2>/dev/null \
+            || cp -f /src/packaging/repo-index.html index.html 2>/dev/null || true
         chmod -R a+rX /out
     '
 
