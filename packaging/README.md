@@ -184,3 +184,72 @@ would be attested and signed exactly like a good one. Closing that requires
 reproducible builds with independent rebuilders, which is out of proportion to a
 project this size — it is named here so it is not mistaken for something the
 controls above already handle.
+
+## Rebuilding after a Debian or nginx update
+
+The usual reason to rebuild is that Debian shipped a **new nginx**. The package
+depends on the virtual package `nginx-abi-<version>`, so once the distribution's
+nginx changes ABI, the published `.deb` no longer installs at all — apt refuses
+it rather than letting nginx fail to start.
+
+**Is a rebuild needed?** Compare what the published package requires with what
+the distribution now provides:
+
+```sh
+# what the published package requires. Select the stanza by name: the index
+# also contains the -dbgsym package, and it comes first, so a plain
+# `grep -m1 '^Depends:'` reads the wrong one.
+curl -fsSL https://didi75345.github.io/ngx_http_pgp_auth_module/dists/trixie/main/binary-amd64/Packages \
+  | awk '/^Package: libnginx-mod-http-pgp-auth$/,/^$/' \
+  | grep '^Depends:' | tr ',' '\n' | grep nginx-abi
+
+# same thing from a locally built package, without the repository
+dpkg-deb -f dist/trixie/libnginx-mod-http-pgp-auth_*.deb Depends \
+  | tr ',' '\n' | grep nginx-abi
+
+# what the distribution provides today
+docker run --rm debian:trixie-slim sh -c \
+  'apt-get update -qq && apt-cache show nginx | grep -m1 "^Provides:"'
+```
+
+At the time of writing those agree — `nginx-abi-1.26.3-1` on Trixie and
+`nginx-abi-1.22.1-7` on Bookworm. When they stop agreeing, rebuild.
+
+**A rebuild always needs a version bump.** The package version comes from
+`debian/changelog` (with `~bookworm1` / `~trixie1` appended at build time), so
+rebuilding the same commit produces a package that is byte-different but claims
+the *same* version. apt only offers an upgrade when the version changes, so
+without a bump the rebuild never reaches a single user — and the repository ends
+up serving two different packages under one version, which caches and mirrors
+handle badly. This is why a rebuild is a commit, not just a re-run.
+
+**The steps:**
+
+```sh
+# 1. optional but recommended: confirm the build still passes before committing.
+#    Actions -> packages -> Run workflow. This runs the build and the install
+#    tests; it cannot publish (releases come from v* tags only).
+
+# 2. bump the changelog -- one entry, saying why
+dch -i "Rebuild for nginx ABI 1.28.0-1"      # 1.0.0 -> 1.0.1
+
+# 3. commit and tag
+git commit -am "Rebuild for the new nginx ABI"
+git push
+git tag v1.0.1
+git push origin v1.0.1
+
+# 4. approve the run when it pauses at the `release` environment
+```
+
+The tag push starts the release: build, install-test, then `sign` waits for the
+environment's reviewer, and `deploy` publishes. Nothing else is needed — the
+repository is rebuilt from that run's artifacts, so the superseded packages drop
+out of `pool/` on their own.
+
+Two practical notes. `dch -i` needs `DEBEMAIL` and `DEBFULLNAME` set, or it will
+stamp the entry with whatever the local host thinks your address is — the same
+trap that once put `root@<container-id>` into a published package. And release
+tags are protected against deletion and moving, so check the tag points where you
+intend before pushing it: a mistake is fixed by releasing `v1.0.2`, not by
+rewriting `v1.0.1`.
