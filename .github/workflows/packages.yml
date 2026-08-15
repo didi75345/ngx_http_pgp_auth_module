@@ -289,12 +289,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          # The attestation is only worth anything if something checks it. Each
-          # .deb must carry a provenance statement from THIS repository before it
-          # is allowed anywhere near the signing key.
+          # The attestation is only worth anything if something checks it, and
+          # --repo alone only asks "does SOME attestation from this repository
+          # exist" -- build mints them on branch pushes too, so a .deb attested
+          # by a feat/** push would satisfy that. Bind the check to the workflow
+          # that is allowed to produce releases, to the commit under release, and
+          # to the ref this run was triggered by, so only an attestation minted
+          # by THIS release run is accepted.
           for deb in dist/*/*.deb; do
             echo "=== $deb ==="
-            gh attestation verify "$deb" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "$deb" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/packages.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF"
           done
 
       - name: Build the signed repository
