@@ -106,11 +106,11 @@ The workflow does more than build:
    modules/...`). This is the check that matters: it proves the shipped package
    actually authenticates, not merely that the source compiles. It then removes
    the package and confirms nginx still starts and the symlink is gone.
-3. **sign** — only on a tag or manual run, and only if a signing key is
-   configured. Verifies each package's provenance attestation and its digest
+3. **sign** — only on a `v*` tag, and only if a signing key is configured.
+   Waits for the `release` environment's reviewer before it runs. Verifies each package's provenance attestation and its digest
    manifest, then builds and signs the repository. Holds the signing key; has no
    write access to the repository and runs no third-party action.
-4. **deploy** — publishes what `sign` produced to GitHub Pages. Holds the write
+4. **deploy** — publishes what `sign` produced to GitHub Pages. Tag runs only. Holds the write
    token and the third-party Pages action, and no signing material.
 
 ## Hardening the release path
@@ -119,13 +119,29 @@ Everything below lives in repository settings or in how the signing key itself i
 kept — none of it can be enforced from a file in this repository, so it is listed
 here as the operator's checklist rather than silently assumed.
 
-**1. Make the environment gate real.** The `sign` job declares
-`environment: release`, but an environment with no rules is only a label. In
-*Settings → Environments → release*, add required reviewers and scope
-`APT_GPG_PRIVATE_KEY` / `APT_GPG_PASSPHRASE` to that environment instead of the
-repository. In *Settings → Rules*, protect the `v*` tag pattern. Until both are
-done, the authority to publish a signed package is exactly "repository write
-access" — no separate compromise needed.
+**1. The environment gate.** The `sign` job declares `environment: release`,
+which is only a label until the environment itself carries rules. The expected
+configuration, and the one this repository uses, is:
+
+- **Required reviewers** on the `release` environment, so a run stops and waits
+  for a human before the signing key is available.
+- **Deployment tags limited to `v*`, with no branches allowed.** This is why
+  `sign` and `deploy` run on tag pushes only: a `workflow_dispatch` run carries a
+  branch ref, which the environment refuses, so offering it would just fail at
+  release time. A release is a tag.
+- **Signing secrets held by the environment, not the repository.** If a copy also
+  exists at repository level, any job can read it without going through the gate,
+  and the gate buys nothing — check *Settings → Secrets and variables → Actions*
+  is empty of them.
+- **Administrators not allowed to bypass protection rules.**
+
+Two honest limits. With a single maintainer, "required reviewers" means approving
+your own release — a deliberate confirmation step, not separation of duties.
+`Prevent self-review` should stay off until there is a second trusted reviewer,
+or releases become impossible. And the environment governs *deployment*, not tag
+creation: adding a ruleset in *Settings → Rules* that restricts who may create
+`v*` tags is still worth doing, though with the reviewer gate in place a tag
+alone no longer publishes anything.
 
 **2. Never put the primary key in CI.** Keep the primary key offline (hardware
 token or an airgapped machine) and give CI only a **signing subkey**, with a

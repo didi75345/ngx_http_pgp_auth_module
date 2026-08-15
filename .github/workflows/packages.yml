@@ -26,7 +26,7 @@ permissions:
 # ref-independent group, and everything else stays keyed per ref.
 concurrency:
   group: >-
-    ${{ (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    ${{ startsWith(github.ref, 'refs/tags/v')
         && 'packages-publish'
         || format('packages-{0}', github.ref) }}
   cancel-in-progress: false
@@ -223,7 +223,12 @@ jobs:
   sign:
     name: sign the APT repository
     needs: install-test
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # Tags only. The `release` environment admits the tag pattern `v*` and no
+    # branches, so a workflow_dispatch run (which carries a branch ref) would be
+    # refused by the environment's deployment rules rather than publish anything.
+    # Keeping dispatch here would only produce a confusing failure at release
+    # time; dispatch still runs build and install-test.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     # F-001: the signing secret is scoped to this environment. THIS ALONE IS NOT
     # A GATE -- it only becomes one once the repository owner adds required
@@ -327,7 +332,12 @@ jobs:
   deploy:
     name: deploy the signed repository to Pages
     needs: sign
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # Tags only. The `release` environment admits the tag pattern `v*` and no
+    # branches, so a workflow_dispatch run (which carries a branch ref) would be
+    # refused by the environment's deployment rules rather than publish anything.
+    # Keeping dispatch here would only produce a confusing failure at release
+    # time; dispatch still runs build and install-test.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write  # push the built repository to the gh-pages branch
