@@ -17,7 +17,7 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          ${nginx:abi},
          gnupg
-Recommends: redis-server
+Suggests: redis-server
 Description: PGP-signature authentication module for nginx
  ngx_http_pgp_auth is a native nginx module that authenticates users by PGP
  signature, as a drop-in alternative to HTTP basic auth for protecting
