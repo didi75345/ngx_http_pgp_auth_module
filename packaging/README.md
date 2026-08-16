@@ -63,8 +63,15 @@ public/
 Set `APT_GPG_PRIVATE_KEY` (ASCII-armoured private key) and, if the key is
 protected, `APT_GPG_PASSPHRASE`. The script then writes `InRelease` and
 `Release.gpg` and exports the public key alongside the repository. Without a
-key the tree is still assembled but **unsigned**, which apt only accepts with
-`[trusted=yes]` — acceptable for a local smoke test, not for publication.
+key the script refuses to run, so an unsigned tree is never produced by
+accident. For a local smoke test, ask for it explicitly:
+
+```sh
+APT_REPO_ALLOW_UNSIGNED=1 sh packaging/build-apt-repo.sh
+```
+
+The result is **unsigned**, which apt only accepts with `[trusted=yes]` —
+acceptable while testing, never for publication.
 
 Generating a dedicated archive key. **What goes into CI is a signing subkey,
 never the primary key** — see "Hardening the release path" below for why, and for
