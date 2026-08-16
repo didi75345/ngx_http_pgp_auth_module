@@ -9,13 +9,42 @@
 #
 # Signing: if a private key is available the Release file is signed, producing
 # InRelease (inline) and Release.gpg (detached), and the corresponding public
-# key is exported next to the repo so clients can verify it. Provide the key
-# either as an ASCII-armoured private key in $APT_GPG_PRIVATE_KEY, or by
-# pointing $APT_GPG_KEY_ID at a key already present in the invoking user's
-# keyring. Without a key the repo is still built but left unsigned, which apt
-# will only accept with [trusted=yes] -- fine for a local smoke test, not for
-# anything published.
+# key is exported next to the repo so clients can verify it.
+#
+# The key is supplied ONE way: an ASCII-armoured private key in
+# $APT_GPG_PRIVATE_KEY (in CI, a signing subkey -- see packaging/README.md).
+# There is deliberately no "use a key already in the caller's keyring" mode: it
+# would mean reaching into a developer's own keyring and exporting secret
+# material out of it, and the earlier version of this comment advertised such a
+# mode ($APT_GPG_KEY_ID) that was never implemented -- so a caller who followed
+# it got an unsigned repository. Setting that variable is now a hard error
+# rather than a surprise.
+#
+# Without a key the repo is still built but left unsigned, which apt will only
+# accept with [trusted=yes] -- fine for a local smoke test, not for anything
+# published.
 set -eu
+
+if [ -n "${APT_GPG_KEY_ID:-}" ]; then
+    echo "build-apt-repo.sh: APT_GPG_KEY_ID is not supported." >&2
+    echo "  Earlier documentation offered it; the script never implemented it, so" >&2
+    echo "  setting it produced an UNSIGNED repository. Export the key instead:" >&2
+    echo "    APT_GPG_PRIVATE_KEY=\"\$(gpg --armor --export-secret-subkeys <SUBKEY-ID>!)\"" >&2
+    exit 2
+fi
+
+# An unsigned repository is a legitimate local smoke test and a disaster if it
+# reaches users, and the two are told apart only by intent -- so intent has to be
+# stated. Without a key the script used to print a warning and exit 0, which is
+# easy to miss in a build log and leaves a publishable-looking tree behind.
+if [ -z "${APT_GPG_PRIVATE_KEY:-}" ] && [ "${APT_REPO_ALLOW_UNSIGNED:-0}" != "1" ]; then
+    echo "build-apt-repo.sh: no signing key in \$APT_GPG_PRIVATE_KEY." >&2
+    echo "  Refusing to build an unsigned repository by accident." >&2
+    echo "  For a local smoke test, ask for it explicitly:" >&2
+    echo "    APT_REPO_ALLOW_UNSIGNED=1 sh packaging/build-apt-repo.sh" >&2
+    echo "  apt will then only accept the result with [trusted=yes]." >&2
+    exit 2
+fi
 
 DISTDIR="${1:-$(pwd)/dist}"
 OUTDIR="${2:-$(pwd)/public}"
