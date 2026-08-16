@@ -130,9 +130,10 @@ gpg --show-keys --with-fingerprint "$key"
 sudo gpg --dearmor -o /usr/share/keyrings/pgp-auth-archive-keyring.gpg < "$key"
 rm -f "$key"
 
-# 2. add the repository (replace $(lsb_release -cs) if you prefer to hardcode)
+# 2. add the repository (hardcode the codename instead if you prefer)
+. /etc/os-release        # $VERSION_CODENAME -- lsb_release is not installed by default
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pgp-auth-archive-keyring.gpg] \
-https://didi75345.github.io/ngx_http_pgp_auth_module $(lsb_release -cs) main" \
+https://didi75345.github.io/ngx_http_pgp_auth_module $VERSION_CODENAME main" \
   | sudo tee /etc/apt/sources.list.d/pgp-auth.list
 
 # 3. install
