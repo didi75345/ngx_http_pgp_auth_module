@@ -49,8 +49,14 @@ ngx_shm_zone_t *ngx_http_pgp_nonce_add_zone(ngx_conf_t *cf, size_t size);
  * Record a nonce as used, atomically.
  *   NGX_OK       - first use; the nonce is now recorded until `exp`
  *   NGX_DECLINED - already used (replay): reject the login
- *   NGX_ERROR    - backend failure
+ *   NGX_ERROR    - backend failure: reject the login
  * For NGX_HTTP_PGP_NONCE_NONE this is a no-op returning NGX_OK.
+ *
+ * Every backend fails CLOSED. In particular "redis" does not degrade to its
+ * per-node companion store when Redis is unreachable: a local "not seen here"
+ * says nothing about the other nodes, so granting on it would give one captured
+ * signed response a session on every node in the fleet. The local store is kept
+ * as a reject-only second line -- it can deny on its own, never admit.
  */
 ngx_int_t ngx_http_pgp_nonce_check_and_set(ngx_http_pgp_verify_result_t *vr,
     ngx_http_pgp_nonce_conf_t *nc, ngx_str_t *nonce, time_t exp);
