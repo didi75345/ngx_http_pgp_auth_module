@@ -58,12 +58,25 @@ SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$OUTDIR"
 
 # The private key and its passphrase are handed over as 0600 files on a private
-# mount rather than in the container's environment: an environment variable is
+# mount rather than in any process's environment: an environment variable is
 # readable through `docker inspect` and /proc/<pid>/environ for the life of the
-# container, and anything that can read one of the two can read the other.
-KEYDIR=$(mktemp -d)
+# process, and anything that can read one of the two can read the other.
+#
+# Prefer /dev/shm, so the key never lands on a persistent filesystem: it is
+# tmpfs, so the bytes live in memory and are freed with the directory, whereas
+# an `rm` under a disk-backed $TMPDIR unlinks the name and leaves the blocks.
+# Fall back to mktemp's own default where /dev/shm is absent (non-Linux) or not
+# writable -- the 0600/0700 modes still apply there.
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    KEYDIR=$(TMPDIR=/dev/shm mktemp -d)
+else
+    KEYDIR=$(mktemp -d)
+fi
 chmod 700 "$KEYDIR"
-trap 'rm -rf "$KEYDIR"' EXIT INT TERM
+# HUP and QUIT as well as the obvious three: HUP is what a dropped SSH session
+# or a closed terminal sends, which is the most ordinary way a long build dies,
+# and without it the key file would be left behind with nothing to sweep it up.
+trap 'rm -rf "$KEYDIR"' EXIT INT TERM HUP QUIT
 if [ -n "${APT_GPG_PRIVATE_KEY:-}" ]; then
     printf '%s' "$APT_GPG_PRIVATE_KEY" > "$KEYDIR/private.asc"
     chmod 600 "$KEYDIR/private.asc"
@@ -72,6 +85,14 @@ if [ -n "${APT_GPG_PASSPHRASE:-}" ]; then
     printf '%s' "$APT_GPG_PASSPHRASE" > "$KEYDIR/passphrase"
     chmod 600 "$KEYDIR/passphrase"
 fi
+
+# Now that both are on the private mount, drop them from OUR environment before
+# forking anything. The caller exports them (the release workflow sets them from
+# repository secrets), so every child -- starting with the docker CLI below --
+# would otherwise inherit the armoured secret key in its own /proc/<pid>/environ
+# for the whole build. Passing the key by mount instead of `-e` moved it out of
+# the container; this is what takes it out of the host side too.
+unset APT_GPG_PRIVATE_KEY APT_GPG_PASSPHRASE
 
 docker run --rm \
     -v "$DISTDIR":/dist:ro \
