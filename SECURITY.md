@@ -197,7 +197,10 @@ close operational gaps.
 - **Adaptive per-IP failure throttle** (`pgp_auth_failure_limit`, off by
   default). Catches a slow, patient credential-probing pattern that stays under
   a uniform `limit_req` — it bans an IP after repeated *failed* verifications and
-  clears it the moment that IP succeeds. It runs before any gpg work, mirrors the
+  clears it the moment that IP succeeds. Only outcomes the *client* is
+  responsible for count: if the single-use nonce store itself is unavailable the
+  request answers 503 and is not recorded, so an infrastructure fault cannot ban
+  the users who were logging in correctly. It runs before any gpg work, mirrors the
   already-reviewed nonce-store shared-memory design, and fails open (degrades to
   `limit_req` alone) if its zone is full, since it is an extra layer rather than
   the primary control.
@@ -409,22 +412,23 @@ operator should do about them.
   concurrent logins, or use the `redis` backend where single-use must hold
   across nodes and under sustained load.
 
-- **The `redis` backend survives a Redis outage without failing open.** Redis
-  gives fleet-wide single-use, but the module also keeps a per-node
-  shared-memory store (the same one the `memory` backend uses) and records every
-  nonce in both. If Redis becomes **unreachable** (connection refused, timeout,
-  network partition), the module falls back to that local store: a fresh login
-  still works, but a replay of a nonce this node has already seen is rejected —
-  so a captured token cannot be replayed during the outage, nor after Redis
-  recovers (it was recorded locally the first time). The fallback covers only a
-  genuine *unreachable* Redis; a Redis that is reachable but rejects the request
-  (a wrong `AUTH` password, a TLS or protocol error, an error reply) still fails
-  closed, because falling back there would let a tampered or misconfigured
-  connection bypass the cross-node check. The residual limit is multi-node
-  during an outage: node A doesn't see node B's locally-recorded nonces until
-  Redis is back, so a captured token could be replayed once *on a different
-  node* during the outage window — narrower than the previous behaviour and
-  bounded by `pgp_challenge_timeout`.
+- **The `redis` backend fails closed when Redis cannot answer.** Redis is what
+  makes single-use hold *across nodes*; the module also records every nonce in
+  the per-node shared-memory zone, but that zone is a **reject-only** second
+  line. It can turn a login down on its own; it can never wave one through.
+  The asymmetry is deliberate. A local *"I have not seen this"* says nothing
+  about the other nodes — each node's zone is private — so granting on it during
+  an outage would let one captured signed response buy a session on **every**
+  node in the fleet. A local *"I have seen this"* is a fact that stays true
+  regardless of Redis, which is what still covers a Redis that comes back **empty**
+  after a restart, a flush, or an eviction. So an unreachable Redis (connection
+  refused, timeout, partition) is treated exactly like a reachable-but-erroring
+  one (wrong `AUTH`, TLS or protocol error, error reply): the login is denied
+  with **503**, not a 4xx — the credentials were never the problem — and the
+  attempt is **not** counted against the client's IP by the failure throttle,
+  so an outage cannot ban the people who were logging in correctly.
+  This trades availability for integrity, on purpose: **while Redis is down,
+  nobody can log in.** See below before choosing it.
 
 - **`pgp_revocation_fail_open on` weakens revocation by design.** With it set, an
   unreadable revocation list admits keys instead of denying them. The module
@@ -455,6 +459,40 @@ operator should do about them.
   needs no `location` to serve them). This is a deliberate, accepted trade-off:
   a slightly weaker style-src on one internal login page, in exchange for a
   module that drops in with no companion files.
+
+### Operating the `redis` nonce backend
+
+Fail-closed is only the right default if you plan for the outage. There is
+deliberately no directive to turn it off — a switch that restores per-node
+grants would just be the same weakness behind a flag. The honest alternative is
+`pgp_auth_nonce_storage memory`, which enforces single-use per node and says so.
+
+- **Never put the console you need in order to fix Redis behind this module.**
+  Keep an out-of-band path (SSH, or a management `server` block without
+  `pgp_auth on`). This is the one that turns an incident into an outage.
+- **Redis downtime must stay shorter than `pgp_session_timeout`** (default 1h).
+  Existing sessions keep working during an outage — only *new logins* are
+  denied, and sessions have an absolute expiry with no sliding renewal. An
+  outage longer than the session lifetime locks out even people already working.
+- **Alert on `pgp_auth: redis connect failed`** in the error log. The structured
+  event line `pgp_auth_event: result="error" reason="nonce_store_error"` marks
+  the same requests at `info` level. Both distinguish an outage from a flood of
+  bad signatures, which is otherwise the same 503-vs-403 you'd have to guess at.
+- **Break-glass, if the outage will outlast the session lifetime:** change the
+  single `pgp_auth_nonce_storage redis;` line to `memory`, `nginx -t`,
+  `nginx -s reload`. Nothing on the config path contacts Redis, so this works
+  while Redis is down; `pgp_auth_nonce_storage_address` may stay in place. The
+  shared zone is reused across a reload, so nonces already recorded locally are
+  still rejected. **Switch back when Redis returns** — `memory` is a standing
+  fleet-wide downgrade, and nothing expires it for you.
+- **A retry during an outage can log as a replay.** The local zone records the
+  nonce before the denial, so re-POSTing the *same* signed block returns
+  "challenge already used" rather than 503. Reload for a fresh challenge; a
+  burst of `reason="replay"` during an outage is usually self-inflicted, not an
+  attack.
+- **A black-holed Redis costs 500 ms per login attempt** (the connect deadline).
+  Keep `pgp_gpg_thread_pool` on so that wait is off the worker's event loop, and
+  keep the global `limit_req` from `examples/nginx.conf` in place.
 
 ## Verification
 

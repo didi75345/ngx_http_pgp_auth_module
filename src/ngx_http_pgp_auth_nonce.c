@@ -574,12 +574,13 @@ ngx_http_pgp_nonce_redis(ngx_http_pgp_verify_result_t *vr, ngx_http_pgp_nonce_co
         ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: redis connect failed");
         /*
-         * Could not reach Redis at all (refused/timeout/partition) -- a genuine
-         * outage. Signalled distinctly (NGX_ABORT) so the caller can fall back
-         * to the per-node store. Every failure AFTER a connection is
-         * established (AUTH rejected, TLS error, protocol error, error reply)
-         * keeps returning NGX_ERROR and fails closed -- Redis is reachable and
-         * telling us something, so we must not silently downgrade to local.
+         * Could not reach Redis at all (refused/timeout/partition, or this
+         * worker being out of file descriptors) -- a genuine outage. Kept
+         * distinct from NGX_ERROR (reachable but erroring: AUTH rejected, TLS
+         * error, protocol error, error reply) so the two can be told apart in
+         * the log and by an operator. BOTH fail closed at the caller: neither
+         * can speak for the fleet, and the per-node store must never be
+         * substituted for one that can.
          */
         return NGX_ABORT;
     }
@@ -670,7 +671,7 @@ ngx_int_t
 ngx_http_pgp_nonce_check_and_set(ngx_http_pgp_verify_result_t *vr,
     ngx_http_pgp_nonce_conf_t *nc, ngx_str_t *nonce, time_t exp)
 {
-    ngx_int_t  redis_rc, local_rc;
+    ngx_int_t  redis_rc;
 
     switch (nc->storage) {
 
@@ -679,42 +680,52 @@ ngx_http_pgp_nonce_check_and_set(ngx_http_pgp_verify_result_t *vr,
 
     case NGX_HTTP_PGP_NONCE_REDIS:
         /*
-         * Cross-node single-use via Redis, backed by a per-node shared-memory
-         * store so the guarantee survives a Redis outage. The nonce is recorded
-         * in BOTH: Redis for the fleet-wide view, and the local zone so this
-         * node still rejects a nonce it has already seen even while Redis is
-         * unreachable -- which is what closes the fail-open replay window (a
-         * captured token can't be replayed during an outage, nor once Redis
-         * recovers, because the local store recorded it the first time).
+         * Cross-node single-use via Redis. The nonce is recorded in BOTH stores:
+         * Redis holds the fleet-wide view, and the per-node shared-memory zone
+         * is a REJECT-ONLY second line -- it can turn a login down on its own,
+         * it can never wave one through.
          *
-         * Precedence: if this node has already seen the nonce, it's a replay,
-         * decide immediately. Otherwise Redis's answer wins when it can give
-         * one; if Redis is unreachable, fall back to the local answer; if
-         * neither store can answer, fail closed (deny).
+         * That asymmetry is the whole point. A local "I have not seen this"
+         * says nothing about the other nodes, because each node's zone is
+         * private (ngx_shared_memory_add, one zone per instance); granting on
+         * it during a Redis outage would hand one captured signed response a
+         * session on every node in the fleet -- the exact fleet-wide single-use
+         * guarantee the operator selected this backend to get. A local "I have
+         * seen this" is a fact about a nonce that was definitely used once, and
+         * stays true no matter what Redis says -- which is what still covers a
+         * Redis that came back up empty after a restart, a flush, or an eviction.
+         *
+         * Precedence:
+         *   1. this node has already seen the nonce      -> replay, deny now
+         *   2. Redis answers (fresh / already-used)      -> that verdict wins
+         *   3. Redis cannot answer, for any reason       -> fail closed
+         *
+         * Case 3 covers an unreachable Redis (NGX_ABORT) exactly as it covers a
+         * reachable-but-erroring one (NGX_ERROR): a store that cannot speak for
+         * the fleet must not be substituted with one that can only speak for
+         * this node. An outage therefore denies new logins rather than
+         * degrading the guarantee -- deliberately trading availability for
+         * integrity. An operator who wants the opposite trade already has
+         * `pgp_auth_nonce_storage memory`, which states per-node enforcement
+         * honestly instead of pretending to a fleet-wide one it cannot keep.
          */
-        if (nc->zone != NULL) {
-            local_rc = ngx_http_pgp_nonce_memory(vr, nc->zone, nonce, exp);
-            if (local_rc == NGX_DECLINED) {
-                return NGX_DECLINED;               /* this node already saw it */
-            }
-        } else {
-            local_rc = NGX_ERROR;                  /* no fallback zone */
+        if (nc->zone != NULL
+            && ngx_http_pgp_nonce_memory(vr, nc->zone, nonce, exp)
+               == NGX_DECLINED)
+        {
+            return NGX_DECLINED;                   /* this node already saw it */
         }
 
         redis_rc = ngx_http_pgp_nonce_redis(vr, nc, nonce, exp);
         if (redis_rc == NGX_OK || redis_rc == NGX_DECLINED) {
             return redis_rc;                       /* Redis gave a fleet verdict */
         }
-        if (redis_rc == NGX_ABORT) {
-            /* Redis unreachable (outage) -> rely on the local store's verdict. */
-            return (local_rc == NGX_OK) ? NGX_OK : NGX_ERROR;
-        }
 
         /*
-         * redis_rc == NGX_ERROR: Redis is reachable but errored (AUTH rejected,
-         * TLS/protocol failure, error reply). Do NOT fall back to local -- that
-         * would let a misconfigured or tampered AUTH bypass the cross-node
-         * check. Fail closed.
+         * NGX_ABORT (unreachable: connect refused/timeout/partition, or the
+         * worker being out of file descriptors) or NGX_ERROR (reachable but
+         * errored: AUTH rejected, TLS/protocol failure, error reply). Neither
+         * yields a fleet-wide answer, so neither may grant.
          */
         return NGX_ERROR;
 

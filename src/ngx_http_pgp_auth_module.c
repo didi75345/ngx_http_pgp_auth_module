@@ -936,7 +936,11 @@ ngx_http_pgp_log_event(ngx_http_request_t *r, const char *result,
  * touches no request state, and logs nothing directly (diagnostics are deferred
  * into vr->diag). So the async path runs this on the verification thread right
  * after gpg -- keeping the (possibly blocking, Redis) nonce round-trip off the
- * worker as well (Pentest CCS F-001). Returns NGX_OK / NGX_DECLINED / NGX_ERROR.
+ * worker as well (Pentest CCS F-001).
+ *
+ * Returns NGX_OK, NGX_DECLINED (the client's challenge was bad, expired or
+ * already used), NGX_ABORT (the single-use store could not answer -- our fault,
+ * not theirs) or NGX_ERROR.
  */
 static ngx_int_t
 ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
@@ -1050,10 +1054,17 @@ ngx_http_pgp_validate_consume(ngx_http_pgp_verify_result_t *vr,
         return NGX_DECLINED;
     }
     if (rc != NGX_OK) {
+        /*
+         * The store could not answer (Redis unreachable or erroring, or the
+         * memory zone full). NGX_ABORT rather than NGX_DECLINED: this is an
+         * infrastructure fault, not a client one, so it must not be answered
+         * as "your signature was rejected" nor counted against the client's
+         * IP by the failure throttle -- see ngx_http_pgp_verify_finalize().
+         */
         ngx_http_pgp_defer_diag(vr, NGX_LOG_ERR,
                       "pgp_auth: nonce store error; rejecting");
         vr->chal_reason = "nonce_store_error";
-        return NGX_DECLINED;
+        return NGX_ABORT;
     }
 
     vr->chal_reason = "valid_signature";
@@ -1105,7 +1116,9 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
          * itself (which touches r->connection->log) is restricted to the
          * worker, and this is the worker.
          */
-        ngx_http_pgp_log_event(r, rc == NGX_ERROR ? "error" : "denied",
+        ngx_http_pgp_log_event(r,
+                               (rc == NGX_ERROR || rc == NGX_ABORT)
+                                   ? "error" : "denied",
                                vr->chal_reason ? vr->chal_reason : "unknown",
                                &fpr);
         return rc;
@@ -1119,14 +1132,41 @@ ngx_http_pgp_verify_post(ngx_http_request_t *r,
 
 
 /*
- * Turn a verify result code (NGX_HTTP_SEE_OTHER on success, NGX_ERROR on an
- * internal failure, anything else = verification failed) into the response.
- * Shared by the sync submit path and the async thread-completion handler.
+ * Turn a verify result code (NGX_HTTP_SEE_OTHER on success, NGX_ABORT when the
+ * single-use store could not answer, NGX_ERROR on an internal failure, anything
+ * else = verification failed) into the response. Shared by the sync submit path
+ * and the async thread-completion handler.
  */
 static void
 ngx_http_pgp_verify_finalize(ngx_http_request_t *r,
     ngx_http_pgp_auth_loc_conf_t *plcf, ngx_int_t rc)
 {
+    /*
+     * NGX_ABORT: our own single-use store could not answer, so the client never
+     * got a verdict on their signature. Two consequences, both served by
+     * returning here, before the throttle ever sees the attempt.
+     *
+     * It is not a failed login, so it must not be counted as one. A ban
+     * outlives the outage that caused it (pgp_auth_failure_ban_time, 300s by
+     * default), so counting these would let a brief Redis blip lock out the
+     * very people who were logging in correctly, for far longer than the blip.
+     * Nor can this be used to dodge the throttle: the nonce is consumed only
+     * after gpg has already accepted a signature from a keyring key, so a
+     * client who reaches this path has authenticated, and one who cannot never
+     * gets here at all.
+     *
+     * And it answers 503, not the 403-plus-challenge a rejected signature gets.
+     * The credentials were never the problem: a 4xx would tell the user to try
+     * different ones, and re-serving the challenge would only burn challenges
+     * against a store that is still down. A 5xx is also what a load balancer
+     * and an on-call operator need in order to tell an infrastructure fault
+     * from a flood of bad signatures.
+     */
+    if (rc == NGX_ABORT) {
+        ngx_http_finalize_request(r, NGX_HTTP_SERVICE_UNAVAILABLE);
+        return;
+    }
+
     ngx_http_pgp_throttle_record(r, plcf->failure_zone,
         rc == NGX_HTTP_SEE_OTHER, plcf->failure_limit, plcf->failure_window,
         plcf->failure_ban_time);
