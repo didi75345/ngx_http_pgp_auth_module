@@ -244,9 +244,10 @@ http {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/session.key;
-            # redis backend pointed at a dead port == a Redis outage. Single-use
-            # must still hold via the per-node shared-memory fallback: a fresh
-            # login works, a replay of the same nonce is rejected.
+            # redis backend pointed at a dead port == a Redis outage. The redis
+            # backend promises single-use across the whole fleet, and a per-node
+            # store cannot keep that promise -- so an outage must DENY logins
+            # (503) rather than degrade to a local answer.
             pgp_auth_nonce_storage redis;
             pgp_auth_nonce_storage_address 127.0.0.1:6399;
             root $WORK/html;
@@ -678,22 +679,32 @@ grep -qi '^set-cookie:' "$WORK/hcl" \
     && ok "out-of-bounds pgp_gpg_timeout is clamped (login still works)" \
     || bad "timeout clamp (login failed -- 1ms not clamped?)"
 
-# Redis fail-open replay (finding 002): /redisdown/ uses the redis backend
-# pointed at a dead port -- a Redis outage. Single-use must survive it via the
-# per-node shared-memory fallback: a FRESH login still works (availability), but
-# a REPLAY of the same nonce is rejected (so a captured token can't be replayed
-# during an outage, nor after Redis recovers, since it was recorded locally).
+# Cross-node nonce replay during a Redis outage (finding 002): /redisdown/ uses
+# the redis backend pointed at a dead port. The redis backend exists to give
+# single-use across every node, and the per-node shared-memory zone cannot speak
+# for the other nodes -- so granting on it during an outage would let ONE
+# captured signed response buy a session on EVERY node. The outage must fail
+# closed instead.
+#
+# The assertions deliberately go past "no cookie": a bare no-cookie check would
+# also pass if gpg were missing or the keyring broken, which is the false pass
+# the previous version of this test avoided by requiring the first login to
+# succeed. Instead we require the *reason*: 503 (an infrastructure fault, not a
+# rejected signature -- so it also stays out of the per-IP failure throttle) and
+# the two log lines that only this path emits. The same key logs in fine at "/"
+# above, so the signature itself is known good.
 curl -s "$base/redisdown/" -o "$WORK/rdA" >/dev/null
 RDCH="$(challenge "$WORK/rdA")"
 printf '%s' "$RDCH" | gpg --clearsign --batch > "$WORK/rd.asc" 2>/dev/null
-curl -s -X POST "$base/redisdown/?__pgp_auth=1" --data-urlencode "signed@$WORK/rd.asc" \
-     -D "$WORK/hrd1" -o /dev/null >/dev/null
-curl -s -X POST "$base/redisdown/?__pgp_auth=1" --data-urlencode "signed@$WORK/rd.asc" \
-     -D "$WORK/hrd2" -o /dev/null >/dev/null
-if grep -qi '^set-cookie:' "$WORK/hrd1" && ! grep -qi '^set-cookie:' "$WORK/hrd2"; then
-    ok "redis outage: fresh login works, replay blocked by local fallback"
+RD1=$(curl -s -o /dev/null -X POST "$base/redisdown/?__pgp_auth=1" \
+          --data-urlencode "signed@$WORK/rd.asc" -D "$WORK/hrd1" -w '%{http_code}')
+if [ "$RD1" = 503 ] \
+   && ! grep -qi '^set-cookie:' "$WORK/hrd1" \
+   && grep -q 'pgp_auth: redis connect failed' "$WORK/logs/error.log" \
+   && grep -q 'reason="nonce_store_error"' "$WORK/logs/error.log"; then
+    ok "redis outage: login fails closed (503), no per-node grant"
 else
-    bad "redis-outage single-use fallback (1st should grant, replay should deny)"
+    bad "redis-outage fail-closed (got $RD1, wanted 503 + nonce_store_error)"
 fi
 
 # pgp_gpg_path pointing at a nonexistent binary: must fail *safely* (login

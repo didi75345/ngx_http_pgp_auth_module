@@ -45,7 +45,8 @@ typedef struct {
      * (Pentest CCS F-001). The worker reads the outcome here.
      */
     ngx_uint_t chal_done;           /* 1 = the thread already validated+consumed */
-    ngx_int_t  chal_rc;             /* NGX_OK / NGX_DECLINED / NGX_ERROR */
+    ngx_int_t  chal_rc;             /* NGX_OK / NGX_DECLINED / NGX_ABORT
+                                     * (single-use store unavailable) / NGX_ERROR */
 
     /*
      * Short, static-string reason code for the structured pgp_auth_event log

@@ -32,7 +32,9 @@ already-signed challenge can't be replayed inside its validity window:
   restart, so it does not span multiple nodes.
 - `redis` — a shared store, so single-use holds across every node pointed at the
   same Redis. Use this for a multi-node deployment that needs strict replay
-  protection.
+  protection. It **fails closed**: if Redis cannot answer, logins are denied
+  rather than dropping back to per-node enforcement, so plan for the outage —
+  see [Operating the `redis` nonce backend](SECURITY.md#operating-the-redis-nonce-backend).
 - `none` — no nonce state at all; fully stateless. A signed challenge may then be
   replayed until it expires, so keep `pgp_challenge_timeout` short and serve over
   HTTPS.
@@ -54,7 +56,7 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_session_cookie_samesite` | `Lax` | `SameSite` attribute on the session cookie: `Lax`, `Strict`, or `None`. `None` requires `pgp_session_cookie_secure` on. |
 | `pgp_auth_bind_client_ip` | `on` | Fold the client IP into the token, blocking cross-IP replay. Behind a proxy, configure `ngx_http_realip_module`. Note this adds nothing where every client shares one apparent address — a Tor onion service, or a proxy without realip — since the bound value is then the same for everyone. |
 | `pgp_auth_bind_user_agent` | `on` | Fold the User-Agent into the token, blocking cross-client replay. |
-| `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. `redis` is backed by a per-node shared-memory store as a fallback: if Redis becomes **unreachable**, single-use is still enforced per node (a captured token can't be replayed during the outage or after Redis recovers). A Redis error that is *not* an outage — a rejected `AUTH`, a TLS/protocol failure — still fails closed. |
+| `pgp_auth_nonce_storage` | `memory` | Single-use challenges: `memory` (shared zone), `redis`, or `none`. `redis` enforces single-use **across nodes** and **fails closed**: if Redis cannot answer — unreachable, or reachable but erroring (rejected `AUTH`, TLS/protocol failure) — the login is denied with `503` rather than falling back to per-node enforcement, which could not keep the fleet-wide guarantee. The per-node zone is still written and still *rejects* a nonce this node has seen, so a Redis that comes back empty doesn't reopen replay. See [Operating the `redis` nonce backend](SECURITY.md#operating-the-redis-nonce-backend). |
 | `pgp_auth_nonce_storage_address` | — | `ip:port` of the Redis server (required for `redis`). Must be a **numeric IP**, not a hostname: resolution is done with no DNS lookup, so a slow/unreachable resolver can't block the worker on the login path. |
 | `pgp_auth_nonce_storage_password` | — | Redis `AUTH` password (optional, `redis` only). Sent immediately after connecting; the `SET` is never issued if `AUTH` doesn't return `+OK`. |
 | `pgp_auth_nonce_storage_tls` | `off` | Reach Redis over TLS. The handshake completes before anything is sent, so the `AUTH` password and the nonce never cross the network in clear. |
@@ -229,8 +231,9 @@ a bad signature.
   whose seen-nonce cache is per-node — a captured, already-signed challenge can
   be replayed within `pgp_challenge_timeout`, so keep it short and serve over
   HTTPS. For strict single-use across every node, use `pgp_auth_nonce_storage
-  redis` (a shared store); the default `memory` gives per-node enforcement with
-  no extra dependency.
+  redis` (a shared store), which denies logins while Redis is unreachable rather
+  than silently degrading to per-node enforcement; the default `memory` gives
+  per-node enforcement with no extra dependency and no such outage coupling.
 
 For the threat model, defensive design, and how memory safety is verified
 (ASan/UBSan + the attack suite), see [SECURITY.md](SECURITY.md).
