@@ -73,6 +73,23 @@ APT_REPO_ALLOW_UNSIGNED=1 sh packaging/build-apt-repo.sh
 The result is **unsigned**, which apt only accepts with `[trusted=yes]` —
 acceptable while testing, never for publication.
 
+> **How the secrets are handled.** The two variables are the *interface*, not
+> where the material lives while the build runs. The script immediately writes
+> both to `0600` files in a `0700` directory on `/dev/shm` (tmpfs — memory, not
+> disk), passes that directory to the container as a read-only mount, `unset`s
+> both variables before forking anything, and removes the directory on exit
+> including on `HUP`/`QUIT`. So the key is in no process's environment —
+> neither the container's (`docker inspect`, `/proc/1/environ`) nor the host
+> docker CLI's — and never on a persistent filesystem. Inside the container the
+> passphrase reaches gpg through `--passphrase-file`, never on the command line
+> where `/proc/<pid>/cmdline` would expose it.
+>
+> One honest limit: in CI the workflow step's *own* shell necessarily holds the
+> two variables, because `env:` from repository secrets is how Actions hands
+> them over. The script stops them spreading past that one process; keeping the
+> runner itself trustworthy (ephemeral, single-tenant, gated by the `release`
+> environment) is what covers the rest.
+
 Generating a dedicated archive key. **What goes into CI is a signing subkey,
 never the primary key** — see "Hardening the release path" below for why, and for
 the revocation certificate that makes the subkey recoverable:
