@@ -9,40 +9,21 @@ own key (e.g. **Kleopatra → Notepad → Sign**), pastes the signed block back,
 the module verifies it against a public keyring before granting a session. No
 passwords, and the user's private key never leaves their machine.
 
-## State model
-
-The **authentication tokens themselves are stateless**. Both the challenge and
-the session are HMAC-signed, not server-side records:
-
-```
-challenge = v1|<exp>|<nonce>|<mac>     mac = HMAC(secret, "v1|<exp>|<nonce>")
-session   = <exp>|<fpr>|<mac>          mac = HMAC(secret, "<exp>|<fpr>")
-```
-
-The server recognises its own tokens by re-deriving the MAC with
-`pgp_session_secret`, so a session or challenge needs nothing stored or
-replicated — every node that shares the secret accepts the same tokens.
-
-The one optional piece of state is **single-use challenge enforcement**
-(`pgp_auth_nonce_storage`), which remembers spent challenges so a captured,
-already-signed challenge can't be replayed inside its validity window:
-
-- `memory` (default) — a per-node shared-memory zone. Cheap and dependency-free,
-  but the seen-nonce set is local to each nginx instance and is cleared on
-  restart, so it does not span multiple nodes.
-- `redis` — a shared store, so single-use holds across every node pointed at the
-  same Redis. Use this for a multi-node deployment that needs strict replay
-  protection. It **fails closed**: if Redis cannot answer, logins are denied
-  rather than dropping back to per-node enforcement, so plan for the outage —
-  see [Operating the `redis` nonce backend](SECURITY.md#operating-the-redis-nonce-backend).
-- `none` — no nonce state at all; fully stateless. A signed challenge may then be
-  replayed until it expires, so keep `pgp_challenge_timeout` short and serve over
-  HTTPS.
-
-So out of the box it is stateless apart from a local single-use cache; pick
-`redis` for shared single-use across nodes, or `none` for no server state at all.
-
 ## Directives
+
+A complete, working configuration is this short — everything else has a
+sensible default:
+
+```nginx
+location / {
+    pgp_auth              on;
+    pgp_keyring           /etc/nginx/pubkeys.gpg;
+    pgp_session_secret    /etc/nginx/pgp_secret.key;
+    pgp_challenge_timeout 300s;
+    pgp_session_timeout   24h;
+    proxy_pass            http://127.0.0.1:8080;
+}
+```
 
 | Directive | Default | Meaning |
 |-----------|---------|---------|
@@ -107,17 +88,6 @@ measured per-request costs and the sizing arithmetic. Also set
 `pgp_auth_max_body_size` cap (16k), so an HTTP/2 request with no declared length
 can't be buffered larger than intended before the module's own cap applies.
 
-```nginx
-location / {
-    pgp_auth              on;
-    pgp_keyring           /etc/nginx/pubkeys.gpg;
-    pgp_session_secret    /etc/nginx/pgp_secret.key;
-    pgp_challenge_timeout 300s;
-    pgp_session_timeout   24h;
-    proxy_pass            http://127.0.0.1:8080;
-}
-```
-
 ## Install from the APT repository (Debian)
 
 Packages are published for Debian **Bookworm** and **Trixie** (**amd64**), built
@@ -173,6 +143,29 @@ packaging/build-apt-repo.sh dist public   # signed repo tree in ./public
 See [packaging/README.md](packaging/README.md) for repository hosting and
 signing-key details.
 
+## Setup
+
+```sh
+# 1. allowed signers
+scripts/build-keyring.sh alice.asc bob.asc > /etc/nginx/pubkeys.gpg
+
+# 2. shared HMAC secret (same file on every node)
+scripts/gen-secret.sh > /etc/nginx/pgp_secret.key
+chown nginx /etc/nginx/pgp_secret.key   # the worker user
+chmod 600 /etc/nginx/pgp_secret.key
+```
+
+The secret can forge both sessions and challenges, so keep it readable only by
+the nginx worker user (`chmod 600`). The module logs a `warn` at start-up if the
+file is group- or world-accessible.
+
+The **nginx worker user** (e.g. `www-data`/`nginx`) must be able to read both
+the keyring and the secret, and to write a throwaway directory under the system
+temp dir while verifying. The defaults under `/etc/nginx` cover this. If
+verification fails, nginx logs the exact gpg exit code and message at `warn`
+level — an "exit 2 / cannot open keyring" there means a permissions problem, not
+a bad signature.
+
 ## Build from source
 
 The module needs the system `gpg` binary at runtime and OpenSSL at build time
@@ -198,28 +191,38 @@ make
 Tested against Debian's nginx (Bookworm 1.22, Trixie 1.26.3). On Debian/Ubuntu
 you also need `libssl-dev` and the matching `nginx-dev` headers.
 
-## Setup
+## State model
 
-```sh
-# 1. allowed signers
-scripts/build-keyring.sh alice.asc bob.asc > /etc/nginx/pubkeys.gpg
+The **authentication tokens themselves are stateless**. Both the challenge and
+the session are HMAC-signed, not server-side records:
 
-# 2. shared HMAC secret (same file on every node)
-scripts/gen-secret.sh > /etc/nginx/pgp_secret.key
-chown nginx /etc/nginx/pgp_secret.key   # the worker user
-chmod 600 /etc/nginx/pgp_secret.key
+```
+challenge = v1|<exp>|<nonce>|<mac>     mac = HMAC(secret, "v1|<exp>|<nonce>")
+session   = <exp>|<fpr>|<mac>          mac = HMAC(secret, "<exp>|<fpr>")
 ```
 
-The secret can forge both sessions and challenges, so keep it readable only by
-the nginx worker user (`chmod 600`). The module logs a `warn` at start-up if the
-file is group- or world-accessible.
+The server recognises its own tokens by re-deriving the MAC with
+`pgp_session_secret`, so a session or challenge needs nothing stored or
+replicated — every node that shares the secret accepts the same tokens.
 
-The **nginx worker user** (e.g. `www-data`/`nginx`) must be able to read both
-the keyring and the secret, and to write a throwaway directory under the system
-temp dir while verifying. The defaults under `/etc/nginx` cover this. If
-verification fails, nginx logs the exact gpg exit code and message at `warn`
-level — an "exit 2 / cannot open keyring" there means a permissions problem, not
-a bad signature.
+The one optional piece of state is **single-use challenge enforcement**
+(`pgp_auth_nonce_storage`), which remembers spent challenges so a captured,
+already-signed challenge can't be replayed inside its validity window:
+
+- `memory` (default) — a per-node shared-memory zone. Cheap and dependency-free,
+  but the seen-nonce set is local to each nginx instance and is cleared on
+  restart, so it does not span multiple nodes.
+- `redis` — a shared store, so single-use holds across every node pointed at the
+  same Redis. Use this for a multi-node deployment that needs strict replay
+  protection. It **fails closed**: if Redis cannot answer, logins are denied
+  rather than dropping back to per-node enforcement, so plan for the outage —
+  see [Operating the `redis` nonce backend](SECURITY.md#operating-the-redis-nonce-backend).
+- `none` — no nonce state at all; fully stateless. A signed challenge may then be
+  replayed until it expires, so keep `pgp_challenge_timeout` short and serve over
+  HTTPS.
+
+So out of the box it is stateless apart from a local single-use cache; pick
+`redis` for shared single-use across nodes, or `none` for no server state at all.
 
 ## Security model
 
