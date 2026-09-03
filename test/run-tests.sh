@@ -74,6 +74,12 @@ head -c 48 /dev/urandom | base64 > "$WORK/rot_old.key"; chmod 600 "$WORK/rot_old
 head -c 48 /dev/urandom | base64 > "$WORK/rot_new.key"; chmod 600 "$WORK/rot_new.key"
 echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 
+# SSI subrequest fixtures: a PUBLIC page that tries to pull in a PROTECTED one.
+mkdir -p "$WORK/html/pub" "$WORK/html/prot"
+echo "SUBREQ-SECRET" > "$WORK/html/prot/secret.html"
+printf 'BEGIN <!--#include virtual="/prot/secret.html" --> END\n' \
+    > "$WORK/html/pub/inc.shtml"
+
 # revocation list containing the test key's fingerprint (for the /revoc/ test)
 gpg --list-keys --with-colons test@example.com \
     | awk -F: '/^fpr:/{print $10; exit}' > "$WORK/revoked.txt"
@@ -172,6 +178,24 @@ http {
         }
         # --- session-secret rotation: mint under old, accept during window,
         #     reject once the previous-secret directive is gone ---
+        # --- unauthenticated subrequest must not bypass auth ---
+        # /pub/ is NOT protected and has SSI on; it includes /prot/, which IS
+        # protected. The include runs as a subrequest, so the module must deny
+        # it rather than decline -- declining in PRECONTENT means "carry on",
+        # which would embed protected content in a public page.
+        location /pub/ {
+            # the suite's http{} has no mime.types, so the default type is
+            # text/plain and SSI (which only processes ssi_types, default
+            # text/html) would silently skip the include -- making this test
+            # pass against vulnerable code. Force both.
+            ssi on; ssi_types *; default_type text/html;
+            root $WORK/html;
+        }
+        location /prot/ {
+            pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none; root $WORK/html;
+        }
         location /rot-mint/ {
             pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/rot_old.key;
@@ -1073,6 +1097,19 @@ if grep -qi '^set-cookie:' "$WORK/hnc"; then
 else
     bad "no-store test setup: login did not grant a session"
 fi
+
+# Auth bypass via subrequest: /pub/inc.shtml is public and SSI-includes
+# /prot/secret.html, which sits behind pgp_auth. An unauthenticated subrequest
+# must be DENIED, not declined -- NGX_DECLINED in the PRECONTENT phase means
+# "not handled, carry on", which would serve the protected content into a
+# public page with no session at all.
+curl -s "$base/pub/inc.shtml" -o "$WORK/ssi" >/dev/null
+grep -q "SUBREQ-SECRET" "$WORK/ssi" \
+    && bad "unauthenticated SSI subrequest leaked protected content" \
+    || ok "unauthenticated subrequest cannot bypass auth (SSI include denied)"
+grep -q "BEGIN" "$WORK/ssi" \
+    && ok "the public SSI page still renders around the denied include" \
+    || bad "public SSI page did not render at all"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
