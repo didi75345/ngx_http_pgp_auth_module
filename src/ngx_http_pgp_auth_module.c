@@ -1218,6 +1218,19 @@ ngx_http_pgp_verify_finalize(ngx_http_request_t *r,
         return;
     }
 
+    /*
+     * NGX_ERROR is the same class of fault for the same reason: gpg could not
+     * be forked or its pipes failed, or the HMAC could not be computed. The
+     * client's signature was never judged, so this is not a failed login and
+     * must not be counted as one -- otherwise a broken gpg or an exhausted
+     * pool bans the very people still logging in correctly, for
+     * pgp_auth_failure_ban_time past the fault.
+     */
+    if (rc == NGX_ERROR) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
     ngx_http_pgp_throttle_record(r, plcf->failure_zone,
         rc == NGX_HTTP_SEE_OTHER, plcf->failure_limit, plcf->failure_window,
         plcf->failure_ban_time);
@@ -1234,11 +1247,6 @@ ngx_http_pgp_verify_finalize(ngx_http_request_t *r,
             return;
         }
         ngx_http_finalize_request(r, ngx_http_send_special(r, NGX_HTTP_LAST));
-        return;
-    }
-
-    if (rc == NGX_ERROR) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
 
@@ -1512,6 +1520,13 @@ ngx_http_pgp_send_challenge(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body, size_t max)
 {
+    /*
+     * NGX_DECLINED for anything the CLIENT (or the operator's buffer sizing)
+     * is responsible for -- no body, a body buffered to disk, a body over the
+     * cap. NGX_ERROR is reserved for an internal fault, which today is only a
+     * failed pool allocation. The caller charges the first kind to the client's
+     * per-IP throttle and the second to nobody; see ngx_http_pgp_auth_submit().
+     */
     size_t        len;
     u_char       *p;
     ngx_buf_t    *buf;
@@ -1529,7 +1544,7 @@ ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body, size_t max)
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                           "pgp_auth: request body buffered to disk; raise "
                           "client_body_buffer_size");
-            return NGX_ERROR;
+            return NGX_DECLINED;
         }
         len += buf->last - buf->pos;
     }
@@ -1538,7 +1553,7 @@ ngx_http_pgp_read_body(ngx_http_request_t *r, ngx_str_t *body, size_t max)
     if (len > max) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "pgp_auth: auth body too large (%uz > %uz)", len, max);
-        return NGX_ERROR;
+        return NGX_DECLINED;
     }
 
     body->data = ngx_pnalloc(r->pool, len + 1);
@@ -1729,14 +1744,30 @@ ngx_http_pgp_auth_submit(ngx_http_request_t *r)
      */
     r->keepalive = 0;
 
-    if (ngx_http_pgp_read_body(r, &body, plcf->max_body_size) != NGX_OK) {
+    rc = ngx_http_pgp_read_body(r, &body, plcf->max_body_size);
+
+    if (rc == NGX_ERROR) {
         /*
-         * Go through verify_finalize (rather than answering directly) so this
-         * counts as a failed attempt for the per-IP throttle. A submission that
-         * never reaches verification is still a failed login attempt, and it is
-         * the cheapest one to automate -- if it were not counted, a client could
-         * hammer the login endpoint indefinitely without the throttle ever
-         * seeing it.
+         * We could not allocate for the body. That is our failure, not the
+         * client's, so it answers 500 and is kept off the per-IP throttle --
+         * the same rule the nonce-store outage path follows. Charging it to
+         * the client would let a server under memory pressure ban the people
+         * still logging in correctly.
+         */
+        ngx_http_pgp_log_event(r, "error", "body_alloc_failed", NULL);
+        ngx_http_pgp_verify_finalize(r, plcf, NGX_ERROR);
+        return;
+    }
+
+    if (rc != NGX_OK) {
+        /*
+         * Client-attributable: no body, a body buffered to disk, or one over
+         * the cap. Go through verify_finalize (rather than answering directly)
+         * so it counts as a failed attempt for the per-IP throttle. A
+         * submission that never reaches verification is still a failed login
+         * attempt, and it is the cheapest one to automate -- if it were not
+         * counted, a client could hammer the login endpoint indefinitely
+         * without the throttle ever seeing it.
          */
         ngx_http_pgp_log_event(r, "denied", "unreadable_body", NULL);
         ngx_http_pgp_verify_finalize(r, plcf, NGX_DECLINED);
