@@ -76,7 +76,8 @@ chmod 700 "$KEYDIR"
 # HUP and QUIT as well as the obvious three: HUP is what a dropped SSH session
 # or a closed terminal sends, which is the most ordinary way a long build dies,
 # and without it the key file would be left behind with nothing to sweep it up.
-trap 'rm -rf "$KEYDIR"' EXIT INT TERM HUP QUIT
+BUILDER_TAG="pgp-auth-aptrepo-builder:$$"
+trap 'rm -rf "$KEYDIR"; docker image rm -f "$BUILDER_TAG" >/dev/null 2>&1 || true' EXIT INT TERM HUP QUIT
 if [ -n "${APT_GPG_PRIVATE_KEY:-}" ]; then
     printf '%s' "$APT_GPG_PRIVATE_KEY" > "$KEYDIR/private.asc"
     chmod 600 "$KEYDIR/private.asc"
@@ -94,19 +95,30 @@ fi
 # the container; this is what takes it out of the host side too.
 unset APT_GPG_PRIVATE_KEY APT_GPG_PASSPHRASE
 
-docker run --rm \
+# Signing runs in two stages so the container holding the plaintext key never
+# has a network. Stage 1 has network and NO key: it bakes apt-utils and gnupg
+# into a throwaway image. Stage 2 mounts the key and runs --network none, so
+# even a compromised apt-utils, gnupg or index cannot exfiltrate the key. The
+# base is pinned by digest rather than by the mutable :trixie-slim tag, so the
+# prep stage is not itself a reintroduced trust gap -- re-pin deliberately,
+# never resolve the tag afresh on every build.
+docker build -q -t "$BUILDER_TAG" - >/dev/null <<DOCKERFILE
+FROM debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends apt-utils gnupg \
+ && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+
+docker run --rm --network none \
     -v "$DISTDIR":/dist:ro \
     -v "$OUTDIR":/out \
     -v "$SRCDIR":/src:ro \
     -e "ORIGIN=$ORIGIN" -e "LABEL=$LABEL" -e "ARCH=$ARCH" \
     -e "APT_REPO_VALID_DAYS=${APT_REPO_VALID_DAYS:-30}" \
     -v "$KEYDIR":/keys:ro \
-    debian:trixie-slim \
+    "$BUILDER_TAG" \
     bash -eu -c '
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq --no-install-recommends apt-utils gnupg >/dev/null
-
         cd /out
 
         # pool/ + per-release package indices
