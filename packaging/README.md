@@ -84,6 +84,14 @@ acceptable while testing, never for publication.
 > passphrase reaches gpg through `--passphrase-file`, never on the command line
 > where `/proc/<pid>/cmdline` would expose it.
 >
+>
+> The signing container also has **no network**. It runs `--network none`, and
+> `apt-utils`/`gnupg` are baked in beforehand by a separate prep stage that
+> never sees the key — so a compromised package or index cannot exfiltrate it.
+> Both stages, and the build/test images, are pinned by image **digest** rather
+> than by a floating tag, and the nginx source tarball is checked against
+> `test/nginx-src.sha256`. Re-pin those deliberately; resolving them afresh on
+> every build would move the trust problem rather than close it.
 > One honest limit: in CI the workflow step's *own* shell necessarily holds the
 > two variables, because `env:` from repository secrets is how Actions hands
 > them over. The script stops them spreading past that one process; keeping the

@@ -12,13 +12,26 @@ RELEASE="${1:-trixie}"
 OUTDIR="${2:-$(pwd)/dist/$RELEASE}"
 SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Pin the base image by immutable digest, not by the mutable "$RELEASE-slim"
+# tag: a tag is a pointer anyone with push access upstream can repoint, and the
+# next build would silently pull different content with nothing in this repo
+# changing. Re-pin deliberately, on a schedule -- resolving the tag afresh each
+# build would just move the trust problem rather than close it.
+case "$RELEASE" in
+    trixie)   BASE="debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132" ;;
+    bookworm) BASE="debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171" ;;
+    *) echo "build-deb.sh: no pinned base image for release '$RELEASE'." >&2
+       echo "  Add its digest here before building it." >&2
+       exit 2 ;;
+esac
+
 mkdir -p "$OUTDIR"
 
 docker run --rm \
     -v "$SRCDIR":/src:ro \
     -v "$OUTDIR":/out \
     -e "RELEASE=$RELEASE" \
-    "debian:$RELEASE-slim" \
+    "$BASE" \
     bash -eu -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq

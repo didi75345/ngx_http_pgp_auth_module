@@ -13,8 +13,13 @@ BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
 
 cd "$BUILD"
-curl -fsSL -o nginx.tgz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
-tar xzf nginx.tgz
+# The tarball is checked against the hash pinned in test/nginx-src.sha256.
+# TLS protects it in transit but not against a compromised origin, a CDN edge
+# or a tampered upstream artifact.
+curl -fsSL -o "nginx-${NGINX_VERSION}.tar.gz" \
+     "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+grep " nginx-${NGINX_VERSION}.tar.gz$" "$HERE/test/nginx-src.sha256" | sha256sum -c -
+tar xzf "nginx-${NGINX_VERSION}.tar.gz"
 cd "nginx-${NGINX_VERSION}"
 # configure only to generate objs/ngx_auto_config.h etc. (headers for the addon)
 ./configure --with-compat --add-dynamic-module="$HERE" \
