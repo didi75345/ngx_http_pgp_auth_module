@@ -24,8 +24,13 @@ trap cleanup EXIT
 
 echo "== building nginx $NGINX_VERSION + module with ASan+UBSan =="
 cd "$BUILD"
-curl -fsSL -o nginx.tgz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
-tar xzf nginx.tgz
+# The tarball is checked against the hash pinned in test/nginx-src.sha256.
+# TLS protects it in transit but not against a compromised origin, a CDN edge
+# or a tampered upstream artifact.
+curl -fsSL -o "nginx-${NGINX_VERSION}.tar.gz" \
+     "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+grep " nginx-${NGINX_VERSION}.tar.gz$" "$HERE/test/nginx-src.sha256" | sha256sum -c -
+tar xzf "nginx-${NGINX_VERSION}.tar.gz"
 cd "nginx-${NGINX_VERSION}"
 # --without-http_rewrite_module: avoids requiring PCRE just for this build; it
 # is unrelated to the module under test.

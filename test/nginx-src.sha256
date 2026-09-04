@@ -1,0 +1,13 @@
+# SHA-256 of the nginx source tarballs this project builds against.
+#
+# TLS protects the download in transit but not against a compromised origin, a
+# CDN edge, or a tampered upstream artifact -- so the expected hash is pinned
+# here, in the repository, and every fetch is checked against it. A pin
+# committed to our own tree is a stronger anchor than a signature checked with
+# a key fetched from the same host that served the tarball.
+#
+# To add or move a version: download it, verify it out of band against the
+# detached signature at <url>.asc using a key whose fingerprint you have
+# cross-checked at https://nginx.org/en/pgp_keys.html, then record it here.
+9ebb333a9e82b952acd3e2b4aeb1d4ff6406f72491bab6cd9fe69f0dea737f31  nginx-1.22.1.tar.gz
+69ee2b237744036e61d24b836668aad3040dda461fe6f570f1787eab570c75aa  nginx-1.26.3.tar.gz
