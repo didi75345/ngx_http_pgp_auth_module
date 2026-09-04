@@ -14,6 +14,7 @@ PORT="${PORT:-8899}"
 WORK="$(mktemp -d)"
 PASS=0
 FAIL=0
+SKIP=0
 
 cleanup() {
     rc=$?
@@ -21,7 +22,7 @@ cleanup() {
     # before removing the work tree. Without the wait, a worker still flushing a
     # log file races `rm -rf` and it fails with "Directory not empty", whose
     # non-zero status would then fail the whole run even though the tests passed.
-    for _pf in nginx redis-nginx; do
+    for _pf in nginx redis-nginx thr-nginx; do
         [ -f "$WORK/logs/$_pf.pid" ] \
             && kill "$(cat "$WORK/logs/$_pf.pid")" 2>/dev/null
     done
@@ -73,6 +74,12 @@ head -c 48 /dev/urandom | base64 > "$WORK/rot_old.key"; chmod 600 "$WORK/rot_old
 head -c 48 /dev/urandom | base64 > "$WORK/rot_new.key"; chmod 600 "$WORK/rot_new.key"
 echo "<h1>SECRET-OK</h1>" > "$WORK/html/index.html"
 
+# SSI subrequest fixtures: a PUBLIC page that tries to pull in a PROTECTED one.
+mkdir -p "$WORK/html/pub" "$WORK/html/prot"
+echo "SUBREQ-SECRET" > "$WORK/html/prot/secret.html"
+printf 'BEGIN <!--#include virtual="/prot/secret.html" --> END\n' \
+    > "$WORK/html/pub/inc.shtml"
+
 # revocation list containing the test key's fingerprint (for the /revoc/ test)
 gpg --list-keys --with-colons test@example.com \
     | awk -F: '/^fpr:/{print $10; exit}' > "$WORK/revoked.txt"
@@ -102,6 +109,41 @@ tr '\n' '\r' < "$WORK/revoked.txt" > "$WORK/revoked-cr.txt"
 
 # htpasswd for the auth_basic ordering test (user pgptest / pass pw)
 printf '%s\n' 'pgptest:$apr1$abcd1234$UEURWw71lGBk.LwDG1Xr4/' > "$WORK/htpasswd"
+
+# A fake gpg used by the fingerprint-validation test below: it reports a
+# perfectly well-formed VALIDSIG whose fingerprint fields are NOT hex, and
+# writes the submitted challenge out as the "verified" plaintext. The module
+# must refuse it: a fingerprint from the subprocess reaches a Set-Cookie value,
+# the event log and the revocation check, so anything that is not hex must not
+# be accepted as an identity.
+cat > "$WORK/fakegpg" <<'FAKE'
+#!/bin/sh
+out=""; msg=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --output) out="$2"; shift 2 ;;
+        --*) shift ;;
+        *) msg="$1"; shift ;;
+    esac
+done
+# hand back the clear-signed text as the "verified" plaintext
+[ -n "$out" ] && sed -e '1,/^$/d' -e '/^-----BEGIN PGP SIGNATURE/,$d' "$msg" > "$out"
+BOGUS="ZZZZZZZZ<CR>NOT-HEX-FINGERPRINT-0000000000"
+echo "[GNUPG:] NEWSIG"
+echo "[GNUPG:] VALIDSIG $BOGUS 2026-01-01 1767225600 0 4 0 22 10 01 $BOGUS"
+exit 0
+FAKE
+chmod +x "$WORK/fakegpg"
+
+# second keyring: contains ONLY the gpg2 key (which is NOT in pubkeys.gpg).
+# Used to check that a session minted where that key is allowed does not carry
+# over to a location whose keyring does not contain it.
+GNUPGHOME="$WORK/gpg2" gpg --export evil@example.com > "$WORK/pubkeys-b.gpg" 2>/dev/null
+
+# a revocation list deliberately over pgp_revocation_list_max_size (set to 1k
+# for the /revoc-big/ location below): it must be refused, and refusing it must
+# fail CLOSED like any other unreadable list.
+head -c 4096 /dev/zero | tr '\0' 'A' > "$WORK/revoked-big.txt"
 
 # --- nginx config ------------------------------------------------------------
 {
@@ -136,6 +178,24 @@ http {
         }
         # --- session-secret rotation: mint under old, accept during window,
         #     reject once the previous-secret directive is gone ---
+        # --- unauthenticated subrequest must not bypass auth ---
+        # /pub/ is NOT protected and has SSI on; it includes /prot/, which IS
+        # protected. The include runs as a subrequest, so the module must deny
+        # it rather than decline -- declining in PRECONTENT means "carry on",
+        # which would embed protected content in a public page.
+        location /pub/ {
+            # the suite's http{} has no mime.types, so the default type is
+            # text/plain and SSI (which only processes ssi_types, default
+            # text/html) would silently skip the include -- making this test
+            # pass against vulnerable code. Force both.
+            ssi on; ssi_types *; default_type text/html;
+            root $WORK/html;
+        }
+        location /prot/ {
+            pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none; root $WORK/html;
+        }
         location /rot-mint/ {
             pgp_auth on; pgp_keyring $WORK/pubkeys.gpg;
             pgp_session_secret $WORK/rot_old.key;
@@ -173,6 +233,15 @@ http {
             pgp_revocation_list $WORK/revoked-primary.txt;
             root $WORK/html;
         }
+        location /revoc-big/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_revocation_list $WORK/revoked-big.txt;
+            pgp_revocation_list_max_size 1k;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
         location /revoc-cr/ {
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
@@ -208,6 +277,30 @@ http {
             auth_basic_user_file $WORK/htpasswd;
             pgp_auth on;
             pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+        location /fakefpr/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_gpg_path $WORK/fakegpg;
+            root $WORK/html;
+        }
+        # same session secret, DIFFERENT keyrings: a session granted under
+        # keyring B must not be accepted where only keyring A is trusted.
+        location /scope-a/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+        location /scope-b/ {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys-b.gpg;
             pgp_session_secret $WORK/session.key;
             pgp_auth_nonce_storage none;
             root $WORK/html;
@@ -599,7 +692,7 @@ EOF
         || bad "HTTP/2 login (got '$hcode')"
     [ -f "$WORK/logs/h2.pid" ] && kill "$(cat "$WORK/logs/h2.pid")" 2>/dev/null
 else
-    echo "  SKIP  HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
+    skip "HTTP/2 login (nginx http_v2 / openssl / curl-h2 unavailable)"
 fi
 
 # SameSite: the /strict/ location sets pgp_session_cookie_samesite Strict, so a
@@ -811,7 +904,7 @@ EOF
     [ -f "$WORK/logs/redis-nginx.pid" ] && kill "$(cat "$WORK/logs/redis-nginx.pid")" 2>/dev/null
     kill "$REDISPID" 2>/dev/null || true
 else
-    echo "  SKIP  redis backend + AUTH tests (redis-server not installed)"
+    skip "redis backend + AUTH tests (redis-server not installed)"
 fi
 
 # --- session-secret rotation (closes the gap noted in the addendum) ----------
@@ -840,6 +933,184 @@ grep -q '__pgp_auth' "$WORK/rd" \
     && ok "rotation: old-secret session is rejected once the previous secret is removed" \
     || bad "rotation: old-secret session still accepted after the previous secret was removed"
 
+# --- adaptive per-IP failure throttle -----------------------------------------
+# Runs on its own nginx instance: the throttle is keyed on the client IP in one
+# shared zone, and the main suite deliberately sends many failed logins from
+# 127.0.0.1, which would ban itself mid-run. limit=3 lets one sequence prove
+# both behaviours -- that failures accumulate to a ban, and that a SUCCESSFUL
+# login clears the counter (the client just proved it is not the attacker).
+{
+    [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
+    [ "$(id -u)" = 0 ] && echo "user root;"
+    cat <<EOF
+worker_processes 1; daemon off; error_log $WORK/logs/thr-nginx.log info;
+pid $WORK/logs/thr-nginx.pid;
+events { worker_connections 32; }
+http {
+    server {
+        listen $((PORT + 70));
+        location / {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            pgp_auth_failure_limit 3;
+            pgp_auth_failure_window 60s;
+            pgp_auth_failure_ban_time 300s;
+            root $WORK/html;
+        }
+    }
+}
+EOF
+} > "$WORK/conf/thr.conf"
+"$NGINX_BIN" -p "$WORK" -c conf/thr.conf &
+sleep 1
+tbase="http://127.0.0.1:$((PORT + 70))"
+
+thr_fail() {   # one failed login attempt (rejected before gpg by the pre-check)
+    curl -s -o /dev/null -X POST "$tbase/?__pgp_auth=1" \
+         --data-urlencode "signed=not-a-clear-signed-message" 2>/dev/null
+}
+thr_code() { curl -s -o /dev/null -w '%{http_code}' "$tbase/" 2>/dev/null; }
+
+thr_fail; thr_fail                     # 2 of 3 -- not banned yet
+[ "$(thr_code)" = 429 ] \
+    && bad "throttle bans too early (2 failures with limit 3)" \
+    || ok "throttle does not ban below the configured limit"
+
+# a SUCCESSFUL login must clear that counter
+curl -s "$tbase/" -o "$WORK/thrp" >/dev/null
+THCH="$(challenge "$WORK/thrp")"
+printf '%s' "$THCH" | gpg --clearsign --batch > "$WORK/thr.asc" 2>/dev/null
+curl -s -o /dev/null -D "$WORK/hthr" -X POST "$tbase/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/thr.asc"
+grep -qi '^set-cookie:' "$WORK/hthr" \
+    && ok "throttle: a valid login still succeeds while failures are pending" \
+    || bad "throttle: valid login blocked before the limit"
+
+thr_fail; thr_fail                     # 2 again -- only bans if the reset failed
+[ "$(thr_code)" = 429 ] \
+    && bad "throttle: a successful login did not clear the failure counter" \
+    || ok "throttle: a successful login clears the failure counter"
+
+thr_fail                               # 3rd since the reset -> ban
+THCODE="$(thr_code)"
+[ "$THCODE" = 429 ] \
+    && ok "throttle bans the client after the configured number of failures (429)" \
+    || bad "throttle ban not applied (got $THCODE)"
+
+[ -f "$WORK/logs/thr-nginx.pid" ] && kill "$(cat "$WORK/logs/thr-nginx.pid")" 2>/dev/null
+
+# A VALIDSIG whose fingerprint fields are not hex must not authenticate. Both
+# the primary-key field and the older signing-key fallback are validated, so a
+# non-hex identity can never reach the session cookie or the event log.
+curl -s "$base/fakefpr/" -o "$WORK/ffp" >/dev/null
+FFCH="$(challenge "$WORK/ffp")"
+printf '%s' "$FFCH" | gpg --clearsign --batch > "$WORK/ff.asc" 2>/dev/null
+curl -s -X POST "$base/fakefpr/?__pgp_auth=1" --data-urlencode "signed@$WORK/ff.asc" \
+     -D "$WORK/hff" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hff" \
+    && bad "non-hex fingerprint from gpg is rejected (would reach Set-Cookie)" \
+    || ok "non-hex fingerprint from gpg is rejected"
+
+# Cross-keyring session scope: log in at /scope-b/ (whose keyring trusts only
+# the gpg2 key) and present that cookie at /scope-a/ (which trusts a different
+# key set). Both share pgp_session_secret, which is the documented way to run
+# one secret across a deployment -- so the session must still be confined to
+# the signer set it was issued under.
+curl -s "$base/scope-b/" -o "$WORK/scb" >/dev/null
+SBCH="$(challenge "$WORK/scb")"
+printf '%s' "$SBCH" | GNUPGHOME="$WORK/gpg2" gpg --clearsign --batch > "$WORK/scb.asc" 2>/dev/null
+SCOPECK=$(curl -s -o /dev/null -D - -X POST "$base/scope-b/?__pgp_auth=1" \
+          --data-urlencode "signed@$WORK/scb.asc" \
+          | grep -i '^set-cookie:' | sed 's/^[Ss]et-[Cc]ookie:[ ]*//; s/;.*//' | tr -d '\r')
+if [ -z "$SCOPECK" ]; then
+    bad "cross-keyring test setup: login at /scope-b/ did not grant a session"
+else
+    # NOTE: /scope-a/ has no file at that sub-path, so an ACCEPTED session
+    # yields 404 rather than SECRET-OK. The signal for "was it authenticated"
+    # is therefore the absence of the challenge page (which posts to
+    # ?__pgp_auth=1), not the presence of the secret body.
+    curl -s -H "Cookie: $SCOPECK" "$base/scope-a/" -o "$WORK/sca" >/dev/null
+    if grep -q '__pgp_auth' "$WORK/sca"; then
+        ok "a session is confined to the keyring it was issued under"
+    else
+        bad "session from another keyring is accepted (cross-keyring escalation)"
+    fi
+fi
+
+# A response produced without reading the request body must discard it, or the
+# unread bytes stay in the connection buffer and nginx parses them as a
+# PIPELINED request -- one POST then yields two responses on a single keepalive
+# connection, which behind a proxy is a request/response desync. Uses a raw
+# socket: curl cannot express "send a body that is itself a request".
+if command -v python3 >/dev/null 2>&1; then
+    NRESP=$(python3 - "$PORT" <<'PYPIPE'
+import socket, sys
+body = b"GET /pipe-probe HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+req = (b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+       b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+       b"Content-Type: application/x-www-form-urlencoded\r\n\r\n" + body)
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(req)
+s.settimeout(3)
+data = b""
+try:
+    while True:
+        c = s.recv(65536)
+        if not c:
+            break
+        data += c
+except socket.timeout:
+    pass
+s.close()
+print(data.count(b"HTTP/1.1 "))
+PYPIPE
+)
+    [ "${NRESP:-0}" = "1" ] \
+        && ok "request body is discarded (no pipelined second response)" \
+        || bad "unread body parsed as a pipelined request ($NRESP responses on one connection)"
+else
+    skip "pipelining check (python3 not available)"
+fi
+
+# An oversized revocation list must be refused and must fail closed.
+curl -s "$base/revoc-big/" -o "$WORK/rbp" >/dev/null
+RBCH="$(challenge "$WORK/rbp")"
+printf '%s' "$RBCH" | gpg --clearsign --batch > "$WORK/rb.asc" 2>/dev/null
+curl -s -X POST "$base/revoc-big/?__pgp_auth=1" --data-urlencode "signed@$WORK/rb.asc" \
+     -D "$WORK/hrb" -o /dev/null >/dev/null
+grep -qi '^set-cookie:' "$WORK/hrb" \
+    && bad "oversized revocation list is refused and fails closed" \
+    || ok "oversized revocation list is refused and fails closed"
+
+# The login response hands out the session cookie: it must not be cacheable.
+curl -s "$base/" -o "$WORK/ncp" >/dev/null
+NCCH="$(challenge "$WORK/ncp")"
+printf '%s' "$NCCH" | gpg --clearsign --batch > "$WORK/nc.asc" 2>/dev/null
+curl -s -o /dev/null -D "$WORK/hnc" -X POST "$base/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/nc.asc"
+if grep -qi '^set-cookie:' "$WORK/hnc"; then
+    grep -qi '^cache-control:.*no-store' "$WORK/hnc" \
+        && ok "the session-issuing response is marked no-store" \
+        || bad "session-issuing response has no Cache-Control: no-store"
+else
+    bad "no-store test setup: login did not grant a session"
+fi
+
+# Auth bypass via subrequest: /pub/inc.shtml is public and SSI-includes
+# /prot/secret.html, which sits behind pgp_auth. An unauthenticated subrequest
+# must be DENIED, not declined -- NGX_DECLINED in the PRECONTENT phase means
+# "not handled, carry on", which would serve the protected content into a
+# public page with no session at all.
+curl -s "$base/pub/inc.shtml" -o "$WORK/ssi" >/dev/null
+grep -q "SUBREQ-SECRET" "$WORK/ssi" \
+    && bad "unauthenticated SSI subrequest leaked protected content" \
+    || ok "unauthenticated subrequest cannot bypass auth (SSI include denied)"
+grep -q "BEGIN" "$WORK/ssi" \
+    && ok "the public SSI page still renders around the denied include" \
+    || bad "public SSI page did not render at all"
+
 echo
-echo "RESULT: $PASS passed, $FAIL failed"
+echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

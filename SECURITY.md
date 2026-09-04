@@ -47,7 +47,8 @@ Everything else (the keyring, the secret) is operator-controlled.
 - **Rate-limitable logins.** Each login attempt forks a gpg verification, so
   submissions should be capped with nginx's own `limit_req` keyed on the
   `__pgp_auth` argument — see `examples/nginx.conf` for the exact pattern.
-  Combined with the 5s gpg timeout this bounds the work an attacker can cause.
+  Combined with `pgp_gpg_timeout` (2s by default, clamped to 1s..60s) this
+  bounds the work an attacker can cause.
 
 ## Hardening from the security review
 
@@ -70,6 +71,26 @@ Everything else (the keyring, the secret) is operator-controlled.
   deployment, turn `pgp_session_cookie_secure` off; the `__Host-` prefix is
   then dropped automatically (it requires Secure), so the cookie stays usable.
   Shorter default challenge/session lifetimes shrink the replay window.
+- **Tokens are bound to the trust domain that issued them.** A session cookie
+  and a challenge are MACed over the location's **keyring path** as well as the
+  secret, so a token issued where one signer set is trusted is not accepted
+  where a different one is. This matters because sharing a single
+  `pgp_session_secret` across a deployment is the documented setup, and a
+  session is validated on later requests by MAC, expiry and revocation alone —
+  the keyring is consulted at login, not afterwards. Without this binding, a
+  configuration such as
+
+  ```nginx
+  location /partners/ { pgp_keyring partners.gpg; pgp_session_secret /etc/nginx/pgp.key; }
+  location /admin/    { pgp_keyring admins.gpg;   pgp_session_secret /etc/nginx/pgp.key; }
+  ```
+
+  would let a partner present their session cookie at `/admin/` and be admitted
+  without ever appearing in `admins.gpg`. Locations that share **both** the
+  secret and the keyring still share sessions, which is the intended behaviour
+  for one trust domain spread over several nodes or locations. (Changing a
+  location's keyring path therefore invalidates the sessions issued under the
+  old path — the same one-time re-login as rotating the secret.)
 - **Revocation** (`pgp_revocation_list`): a fingerprint file that revokes a key
   and all of its live sessions without rotating the secret or reloading nginx.
   An unreadable list **fails closed** (denies) by default
@@ -92,6 +113,18 @@ Everything else (the keyring, the secret) is operator-controlled.
   PRECONTENT phase, i.e. *after* `limit_req` (PREACCESS) and `auth_basic` /
   `auth_request` (ACCESS), so those can rate-limit or reject a request before
   any gpg work happens, and PGP auth layers on top of them.
+- **The request body is discarded before the challenge page is written.** The
+  challenge is a response body produced from the PRECONTENT phase without
+  reading the request body, so the module calls
+  `ngx_http_discard_request_body()` first, exactly as nginx's own
+  content-producing modules do. Without it the unread bytes stay in the
+  connection buffer and nginx parses them as a *pipelined* request: a POST to a
+  protected location whose body happens to look like an HTTP request produced
+  two responses on one keepalive connection. Behind a proxy or CDN — the
+  deployment this module is written for — a front end that counted one request
+  while the back end answered two is a request/response desync (smuggling)
+  primitive. Error replies (`429`, `413`) do not need this: nginx's
+  special-response handler discards for them.
 - **Relative redirect.** The post-login redirect uses a relative `Location` so
   it resolves against the URL the browser actually used -- correct behind a
   reverse proxy or TLS terminator, where nginx's own scheme/host/port differ.
@@ -114,7 +147,8 @@ Everything else (the keyring, the secret) is operator-controlled.
   1024, and a fixed bound would leave higher-numbered fds (other client
   connections, listening sockets, log fds) reachable to the gpg subprocess.
 - **Security headers on the login page.** `X-Frame-Options: DENY`,
-  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+  `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+  frame-ancestors 'none'`,
   `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, and
   `Referrer-Policy: no-referrer` are set on the challenge/login response, so
   it can't be framed for clickjacking, MIME-sniffed, or cached.
@@ -204,6 +238,32 @@ close operational gaps.
   already-reviewed nonce-store shared-memory design, and fails open (degrades to
   `limit_req` alone) if its zone is full, since it is an extra layer rather than
   the primary control.
+
+  **It bans by the client address nginx sees.** Behind a reverse proxy or CDN
+  without `ngx_http_realip_module`, and on a Tor onion service (where every
+  request arrives from the local daemon), that address is identical for every
+  client -- so one abusive client would ban *all* of them for
+  `pgp_auth_failure_ban_time`, and an attacker can trigger that deliberately.
+  Configure realip first, or leave the throttle off in those deployments; the
+  module logs this reminder at start-up whenever the throttle is enabled.
+
+  **A ban is global to the nginx instance, not per location.** Counters are
+  keyed on the client address alone and live in one shared-memory segment
+  (`pgp_auth_throttle`), so failures at `/admin/` also ban that address at
+  `/partners/`, in every server block, for `pgp_auth_failure_ban_time`. That is
+  usually what you want from an anti-probing control, but it does mean two
+  unrelated applications behind the same nginx share one throttle: a limit set
+  for a low-traffic admin area also applies to whatever else uses the module.
+  Keep the limit high enough for the most-used of them, or enable the throttle
+  in only one application per nginx instance.
+
+  **Every** failed login submission counts, including the ones rejected before
+  gpg is forked (a body that is not a clear-signed message, or one that could not
+  be read). Those are the cheapest failures to automate, so a throttle that
+  ignored them would miss exactly the client it exists to catch. A user who
+  simply mis-pastes a signature therefore also accumulates failures — size
+  `pgp_auth_failure_limit` with that in mind, and note that one successful login
+  clears the count.
 
 ## Login endpoint: cost, thread pool, and `limit_req`
 
@@ -493,6 +553,19 @@ grants would just be the same weakness behind a flag. The honest alternative is
 - **A black-holed Redis costs 500 ms per login attempt** (the connect deadline).
   Keep `pgp_gpg_thread_pool` on so that wait is off the worker's event loop, and
   keep the global `limit_req` from `examples/nginx.conf` in place.
+
+### Known limits of this document's assurances
+
+- **Fuzzing covers the two parsers that take the most adversarial input** (the
+  form-field decoder and the gpg status parser, as standalone mirrors). The
+  revocation-list scanner and the Redis reply parser are not fuzzed; they read
+  an operator-supplied file and a semi-trusted network peer respectively.
+- **A duplicate session cookie is resolved by taking the first match.** With the
+  default `__Host-` prefix a sibling subdomain cannot set one, but with
+  `pgp_session_cookie_secure off` (plain HTTP / onion deployments) the prefix is
+  dropped, so a sibling subdomain could plant a second `pgp_session` cookie and
+  force the user to be re-challenged. It cannot forge a session -- the MAC still
+  has to verify -- so the effect is nuisance, not bypass.
 
 ## Verification
 

@@ -9,48 +9,29 @@ own key (e.g. **Kleopatra → Notepad → Sign**), pastes the signed block back,
 the module verifies it against a public keyring before granting a session. No
 passwords, and the user's private key never leaves their machine.
 
-## State model
-
-The **authentication tokens themselves are stateless**. Both the challenge and
-the session are HMAC-signed, not server-side records:
-
-```
-challenge = v1|<exp>|<nonce>|<mac>     mac = HMAC(secret, "v1|<exp>|<nonce>")
-session   = <exp>|<fpr>|<mac>          mac = HMAC(secret, "<exp>|<fpr>")
-```
-
-The server recognises its own tokens by re-deriving the MAC with
-`pgp_session_secret`, so a session or challenge needs nothing stored or
-replicated — every node that shares the secret accepts the same tokens.
-
-The one optional piece of state is **single-use challenge enforcement**
-(`pgp_auth_nonce_storage`), which remembers spent challenges so a captured,
-already-signed challenge can't be replayed inside its validity window:
-
-- `memory` (default) — a per-node shared-memory zone. Cheap and dependency-free,
-  but the seen-nonce set is local to each nginx instance and is cleared on
-  restart, so it does not span multiple nodes.
-- `redis` — a shared store, so single-use holds across every node pointed at the
-  same Redis. Use this for a multi-node deployment that needs strict replay
-  protection. It **fails closed**: if Redis cannot answer, logins are denied
-  rather than dropping back to per-node enforcement, so plan for the outage —
-  see [Operating the `redis` nonce backend](SECURITY.md#operating-the-redis-nonce-backend).
-- `none` — no nonce state at all; fully stateless. A signed challenge may then be
-  replayed until it expires, so keep `pgp_challenge_timeout` short and serve over
-  HTTPS.
-
-So out of the box it is stateless apart from a local single-use cache; pick
-`redis` for shared single-use across nodes, or `none` for no server state at all.
-
 ## Directives
+
+A complete, working configuration is this short — everything else has a
+sensible default:
+
+```nginx
+location / {
+    pgp_auth              on;
+    pgp_keyring           /etc/nginx/pubkeys.gpg;
+    pgp_session_secret    /etc/nginx/pgp_secret.key;
+    pgp_challenge_timeout 300s;
+    pgp_session_timeout   24h;
+    proxy_pass            http://127.0.0.1:8080;
+}
+```
 
 | Directive | Default | Meaning |
 |-----------|---------|---------|
 | `pgp_auth` | `off` | Enable PGP auth for this location. |
 | `pgp_keyring` | `/etc/nginx/pubkeys.gpg` | Public keyring of allowed signers (absolute path). |
-| `pgp_session_secret` | *(random)* | File with the HMAC secret. **Set this** for multi-node / restart-stable sessions. |
+| `pgp_session_secret` | *(random)* | File with the HMAC secret. **Set this** for multi-node / restart-stable sessions. The file is read at start-up and must be non-empty and at most 64k, otherwise nginx refuses to start — the same check applies to `pgp_session_secret_previous` and `pgp_auth_nonce_storage_password_file`, so a mistyped path fails loudly instead of loading a log file as a key. |
 | `pgp_challenge_timeout` | `120s` | How long an issued challenge stays valid. |
-| `pgp_session_timeout` | `1h` | Re-challenge interval. `0` = unlimited (the cookie never expires — a leaked/captured cookie then only ends via `pgp_revocation_list` or rotating the secret; keep a finite value unless you have a specific reason not to). |
+| `pgp_session_timeout` | `1h` | Re-challenge interval. Clamped to a 30-day maximum (a value above it is clamped and logged at startup). `0` = unlimited (the cookie never expires — a leaked/captured cookie then only ends via `pgp_revocation_list` or rotating the secret; keep a finite value unless you have a specific reason not to), and `0` is *not* clamped. |
 | `pgp_session_cookie_secure` | `on` | Add `; Secure` to the session cookie. Set `off` for a plain-HTTP deployment (e.g. one already behind an encrypted transport). |
 | `pgp_session_cookie_host_prefix` | `on` | Use the `__Host-` cookie name prefix. The prefix requires Secure, so it is applied only when `pgp_session_cookie_secure` is on; with Secure off it is dropped (nginx warns) so the cookie stays usable. |
 | `pgp_session_cookie_samesite` | `Lax` | `SameSite` attribute on the session cookie: `Lax`, `Strict`, or `None`. `None` requires `pgp_session_cookie_secure` on. |
@@ -74,10 +55,12 @@ So out of the box it is stateless apart from a local single-use cache; pick
 | `pgp_auth_nonce_storage_password_file` | — | Load the Redis `AUTH` password from a file instead of inline (`pgp_auth_nonce_storage_password`), so it never appears in `nginx -T` output or a committed config. Mutually exclusive with the inline form. |
 | `pgp_disable_core_dumps` | `on` | Disable core dumps for worker processes (`setrlimit(RLIMIT_CORE, 0)` in the master before fork), so the in-memory secret and a client's decrypted plaintext can't be written to a core file. Set `off` if you deliberately need core dumps for debugging. |
 | `pgp_mlock_required` | `off` | The module `mlock()`s secret buffers into RAM so they can't be swapped to disk; if that fails (usually `RLIMIT_MEMLOCK` too low), it logs at error level and continues. Set `on` to make an `mlock()` failure fatal — nginx refuses to start — for deployments that must guarantee secrets never touch swap. |
-| `pgp_auth_failure_limit` | `0` (off) | Adaptive per-IP failure throttle: after this many failed verifications from one IP within `pgp_auth_failure_window`, that IP is banned (`429`) for `pgp_auth_failure_ban_time`; a successful login clears its counter. `0` disables it. A layer on top of `limit_req`, not a replacement. |
-| `pgp_auth_failure_window` | `60s` | Sliding window over which failed attempts are counted for the throttle. |
-| `pgp_auth_failure_ban_time` | `300s` | How long a banned IP stays blocked. |
-| `pgp_auth_failure_zone_size` | `1m` | Shared-memory zone for the failure throttle. Fails open (degrades to `limit_req` only) if full, since it's a best-effort extra layer. |
+| `pgp_auth_failure_limit` | `0` (off) | **Bans by the client address nginx sees** — behind a proxy configure `ngx_http_realip_module` first, and note that on a Tor onion service every client shares one address, so a single abuser would lock out everyone. Adaptive per-IP failure throttle: after this many failed verifications from one IP within `pgp_auth_failure_window`, that IP is banned (`429`) for `pgp_auth_failure_ban_time`; a successful login clears its counter. `0` disables it. A layer on top of `limit_req`, not a replacement. |
+| `pgp_auth_failure_window` | `60s` | Sliding window over which failed attempts are counted for the throttle. Accepted range is 1s..1h; anything outside it falls back to `60s` and is logged at startup. |
+| `pgp_auth_failure_ban_time` | `300s` | How long a banned IP stays blocked. Accepted range is 1s..24h; anything outside it falls back to `300s` and is logged at startup. |
+| `pgp_auth_failure_zone_size` | `1m` | Shared-memory zone for the failure throttle. Fails open (degrades to `limit_req` only) if full, since it's a best-effort extra layer. **This backs one shared segment for the whole nginx config** (zones are identified by name, not per-location), so set it once — e.g. at `http` or `server` level; two locations declaring different sizes makes `nginx -t` fail with a *"conflicts with already declared size"* error. |
+| `pgp_auth_nonce_storage_key_prefix` | `pgp:` | Key namespace for the `redis` backend. Give each deployment its own prefix if several share one Redis, so they cannot delete or pre-create each other's nonces. |
+| `pgp_revocation_list_max_size` | `1m` | Refuse a revocation list larger than this (it is held in memory per worker and scanned on every authenticated request). An oversized list is treated like an unreadable one: denied unless `pgp_revocation_fail_open` is on. |
 
 All directives are valid at `http`, `server`, and `location` scope.
 
@@ -104,17 +87,6 @@ measured per-request costs and the sizing arithmetic. Also set
 `client_max_body_size` on the protected location to match the module's
 `pgp_auth_max_body_size` cap (16k), so an HTTP/2 request with no declared length
 can't be buffered larger than intended before the module's own cap applies.
-
-```nginx
-location / {
-    pgp_auth              on;
-    pgp_keyring           /etc/nginx/pubkeys.gpg;
-    pgp_session_secret    /etc/nginx/pgp_secret.key;
-    pgp_challenge_timeout 300s;
-    pgp_session_timeout   24h;
-    proxy_pass            http://127.0.0.1:8080;
-}
-```
 
 ## Install from the APT repository (Debian)
 
@@ -171,6 +143,29 @@ packaging/build-apt-repo.sh dist public   # signed repo tree in ./public
 See [packaging/README.md](packaging/README.md) for repository hosting and
 signing-key details.
 
+## Setup
+
+```sh
+# 1. allowed signers
+scripts/build-keyring.sh alice.asc bob.asc > /etc/nginx/pubkeys.gpg
+
+# 2. shared HMAC secret (same file on every node)
+scripts/gen-secret.sh > /etc/nginx/pgp_secret.key
+chown nginx /etc/nginx/pgp_secret.key   # the worker user
+chmod 600 /etc/nginx/pgp_secret.key
+```
+
+The secret can forge both sessions and challenges, so keep it readable only by
+the nginx worker user (`chmod 600`). The module logs a `warn` at start-up if the
+file is group- or world-accessible.
+
+The **nginx worker user** (e.g. `www-data`/`nginx`) must be able to read both
+the keyring and the secret, and to write a throwaway directory under the system
+temp dir while verifying. The defaults under `/etc/nginx` cover this. If
+verification fails, nginx logs the exact gpg exit code and message at `warn`
+level — an "exit 2 / cannot open keyring" there means a permissions problem, not
+a bad signature.
+
 ## Build from source
 
 The module needs the system `gpg` binary at runtime and OpenSSL at build time
@@ -196,28 +191,38 @@ make
 Tested against Debian's nginx (Bookworm 1.22, Trixie 1.26.3). On Debian/Ubuntu
 you also need `libssl-dev` and the matching `nginx-dev` headers.
 
-## Setup
+## State model
 
-```sh
-# 1. allowed signers
-scripts/build-keyring.sh alice.asc bob.asc > /etc/nginx/pubkeys.gpg
+The **authentication tokens themselves are stateless**. Both the challenge and
+the session are HMAC-signed, not server-side records:
 
-# 2. shared HMAC secret (same file on every node)
-scripts/gen-secret.sh > /etc/nginx/pgp_secret.key
-chown nginx /etc/nginx/pgp_secret.key   # the worker user
-chmod 600 /etc/nginx/pgp_secret.key
+```
+challenge = v1|<exp>|<nonce>|<mac>     mac = HMAC(secret, "v1|<exp>|<nonce>")
+session   = <exp>|<fpr>|<mac>          mac = HMAC(secret, "<exp>|<fpr>")
 ```
 
-The secret can forge both sessions and challenges, so keep it readable only by
-the nginx worker user (`chmod 600`). The module logs a `warn` at start-up if the
-file is group- or world-accessible.
+The server recognises its own tokens by re-deriving the MAC with
+`pgp_session_secret`, so a session or challenge needs nothing stored or
+replicated — every node that shares the secret accepts the same tokens.
 
-The **nginx worker user** (e.g. `www-data`/`nginx`) must be able to read both
-the keyring and the secret, and to write a throwaway directory under the system
-temp dir while verifying. The defaults under `/etc/nginx` cover this. If
-verification fails, nginx logs the exact gpg exit code and message at `warn`
-level — an "exit 2 / cannot open keyring" there means a permissions problem, not
-a bad signature.
+The one optional piece of state is **single-use challenge enforcement**
+(`pgp_auth_nonce_storage`), which remembers spent challenges so a captured,
+already-signed challenge can't be replayed inside its validity window:
+
+- `memory` (default) — a per-node shared-memory zone. Cheap and dependency-free,
+  but the seen-nonce set is local to each nginx instance and is cleared on
+  restart, so it does not span multiple nodes.
+- `redis` — a shared store, so single-use holds across every node pointed at the
+  same Redis. Use this for a multi-node deployment that needs strict replay
+  protection. It **fails closed**: if Redis cannot answer, logins are denied
+  rather than dropping back to per-node enforcement, so plan for the outage —
+  see [Operating the `redis` nonce backend](SECURITY.md#operating-the-redis-nonce-backend).
+- `none` — no nonce state at all; fully stateless. A signed challenge may then be
+  replayed until it expires, so keep `pgp_challenge_timeout` short and serve over
+  HTTPS.
+
+So out of the box it is stateless apart from a local single-use cache; pick
+`redis` for shared single-use across nodes, or `none` for no server state at all.
 
 ## Security model
 
