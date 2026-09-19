@@ -22,7 +22,7 @@ cleanup() {
     # before removing the work tree. Without the wait, a worker still flushing a
     # log file races `rm -rf` and it fails with "Directory not empty", whose
     # non-zero status would then fail the whole run even though the tests passed.
-    for _pf in nginx redis-nginx thr-nginx; do
+    for _pf in nginx redis-nginx thr-nginx thi-nginx; do
         [ -f "$WORK/logs/$_pf.pid" ] \
             && kill "$(cat "$WORK/logs/$_pf.pid")" 2>/dev/null
     done
@@ -1000,6 +1000,114 @@ THCODE="$(thr_code)"
     || bad "throttle ban not applied (got $THCODE)"
 
 [ -f "$WORK/logs/thr-nginx.pid" ] && kill "$(cat "$WORK/logs/thr-nginx.pid")" 2>/dev/null
+
+# --- finding 005: bounds checks must apply to INHERITED values ----------------
+# The throttle and a >30d session lifetime are configured at http{} ONLY, and
+# used from a location that sets none of them. Before the fix the bounds block
+# ran ahead of the merges: it read the child's unset sentinel, overwrote it with
+# the hardcoded 60s window / 300s ban, and the parent's values were never
+# inherited -- and an inherited session lifetime escaped the 30d cap. The
+# thr.conf test above could not see it: it writes the directives into the
+# location itself, with values that happen to equal the defaults.
+{
+    [ -n "$MODULE_SO" ] && echo "load_module $MODULE_SO;"
+    [ "$(id -u)" = 0 ] && echo "user root;"
+    cat <<EOF
+worker_processes 1; daemon off; error_log $WORK/logs/thi-nginx.log info;
+pid $WORK/logs/thi-nginx.pid;
+events { worker_connections 32; }
+http {
+    pgp_auth_failure_limit 2;
+    pgp_auth_failure_window 30s;
+    pgp_auth_failure_ban_time 7s;
+    pgp_session_timeout 90d;
+    server {
+        listen $((PORT + 71));
+        location / {
+            pgp_auth on;
+            pgp_keyring $WORK/pubkeys.gpg;
+            pgp_session_secret $WORK/session.key;
+            pgp_auth_nonce_storage none;
+            root $WORK/html;
+        }
+    }
+}
+EOF
+} > "$WORK/conf/thi.conf"
+
+# The effective values are stated at start-up, and must be the INHERITED ones.
+# Read them from the start-up error log (-e), not from the terminal: nginx
+# echoes only WARN and above to stderr, so a notice never appears there.
+"$NGINX_BIN" -p "$WORK" -c conf/thi.conf -e "$WORK/logs/thi-startup.log" -t \
+    > "$WORK/thi-t.log" 2>&1 || true
+if grep -q 'failure throttle on: limit 2, window 30s, ban 7s' "$WORK/logs/thi-startup.log"; then
+    ok "throttle set at http{} is inherited (effective 2 / 30s / 7s logged)"
+else
+    bad "throttle set at http{} not inherited: $(cat "$WORK/logs/thi-startup.log" "$WORK/thi-t.log" 2>/dev/null | grep -m1 'failure' | cut -c1-120)"
+fi
+
+"$NGINX_BIN" -p "$WORK" -c conf/thi.conf &
+sleep 1
+ibase="http://127.0.0.1:$((PORT + 71))"
+
+# A session minted here inherits the 90d lifetime from http{} and must be
+# clamped to the 30d maximum.
+curl -s "$ibase/" -o "$WORK/thip" >/dev/null || true
+THICH="$(challenge "$WORK/thip")"
+printf '%s' "$THICH" | gpg --clearsign --batch > "$WORK/thi.asc" 2>/dev/null
+curl -s -o /dev/null -D "$WORK/hthi" -X POST "$ibase/?__pgp_auth=1" \
+     --data-urlencode "signed@$WORK/thi.asc" || true
+THIEXP="$(grep -i '^set-cookie:' "$WORK/hthi" \
+          | sed 's/[Ss]et-[Cc]ookie: //; s/;.*//; s/^[^=]*=//; s/|.*//' | tr -d '\r')"
+case "$THIEXP" in
+    ''|*[!0-9]*)
+        bad "inherited session lifetime: no session issued (got '$THIEXP')" ;;
+    *)
+        THILIFE=$((THIEXP - $(date +%s)))
+        if [ "$THILIFE" -ge 2591000 ] && [ "$THILIFE" -le 2592060 ]; then
+            ok "an inherited 90d session lifetime is clamped to the 30d maximum"
+        else
+            bad "inherited session lifetime not clamped (${THILIFE}s, want ~2592000s)"
+        fi ;;
+esac
+
+# Behavioural proof: two failures reach the inherited limit, and the ban must
+# lift at the inherited 7s -- not at the 300s the pre-fix build substituted.
+thi_fail() {
+    curl -s -o /dev/null -X POST "$ibase/?__pgp_auth=1" \
+         --data-urlencode "signed=not-a-clear-signed-message" 2>/dev/null || true
+}
+thi_code() { curl -s -o /dev/null -w '%{http_code}' "$ibase/" 2>/dev/null || true; }
+thi_fail; thi_fail
+THI0=$(date +%s)
+THIC0="$(thi_code)"
+sleep 2
+THIC2="$(thi_code)"
+THIWAIT=$((THI0 + 9 - $(date +%s)))
+[ "$THIWAIT" -gt 0 ] && sleep "$THIWAIT"
+THIC9="$(thi_code)"
+if [ "$THIC0" = 429 ] && [ "$THIC2" = 429 ] && [ "$THIC9" != 429 ]; then
+    ok "inherited ban time is honoured (banned at 2s, lifted by 9s for a 7s ban)"
+else
+    bad "inherited ban time not honoured (0s: $THIC0, 2s: $THIC2, 9s: $THIC9; want 429/429/not 429)"
+fi
+[ -f "$WORK/logs/thi-nginx.pid" ] && kill "$(cat "$WORK/logs/thi-nginx.pid")" 2>/dev/null
+
+# A configuration that never enables the throttle must produce no throttle
+# diagnostics at all: before the fix every server and location block logged
+# "pgp_auth_failure_window -1s is outside 1s..1h" at ERR on every start.
+# Both the terminal and the start-up log are checked: the ERR lines reach both,
+# a notice only the log.
+"$NGINX_BIN" -p "$WORK" -c conf/nginx.conf -e "$WORK/logs/main-startup.log" -t \
+    > "$WORK/main-t.log" 2>&1 || true
+cat "$WORK/main-t.log" "$WORK/logs/main-startup.log" > "$WORK/main-all.log" 2>/dev/null || true
+THIERR=$(grep -c 'pgp_auth_failure' "$WORK/main-all.log" || true)
+THINOT=$(grep -c 'failure throttle' "$WORK/main-all.log" || true)
+if [ "$THIERR" = 0 ] && [ "$THINOT" = 0 ]; then
+    ok "no throttle diagnostics for a config that never enables the throttle"
+else
+    bad "throttle diagnostics with no throttle configured ($THIERR error, $THINOT notice lines)"
+fi
 
 # A VALIDSIG whose fingerprint fields are not hex must not authenticate. Both
 # the primary-key field and the older signing-key fallback are validated, so a
