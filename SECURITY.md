@@ -238,6 +238,12 @@ close operational gaps.
   already-reviewed nonce-store shared-memory design, and fails open (degrades to
   `limit_req` alone) if its zone is full, since it is an extra layer rather than
   the primary control.
+  At start-up the module writes one `notice` line to the error log stating the
+  limit, window and ban time actually in effect, at each level where the
+  throttle is enabled or its values change, so a setting inherited from
+  `http{}` or `server{}` can be verified rather than assumed. Like any nginx
+  notice it is not echoed to the terminal by `nginx -t`, and on a reload it
+  appears only if `error_log` is set to `notice` or finer.
 
   **It bans by the client address nginx sees.** Behind a reverse proxy or CDN
   without `ngx_http_realip_module`, and on a Tor onion service (where every

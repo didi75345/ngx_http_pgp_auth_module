@@ -2157,46 +2157,6 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * The 5s floor (rather than a larger one) still leaves room for a
      * deliberately short replay window in high-security setups.
      */
-    /*
-     * Bound the remaining lifetimes as well, so a typo cannot quietly create
-     * near-permanent sessions or a throttle that never forgets. 0 keeps its
-     * documented meaning for pgp_session_timeout (no expiry at all).
-     */
-    /* 0 (no expiry) is below the bound, so it passes through untouched. */
-    if (conf->session_timeout > 2592000) {
-        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-            "pgp_auth: pgp_session_timeout %Ts is above the 30d maximum; "
-            "clamping to 2592000s (set 0 if you deliberately want no expiry)",
-            conf->session_timeout);
-        conf->session_timeout = 2592000;
-    }
-
-    if (conf->failure_limit > 0) {
-        if (conf->failure_window < 1 || conf->failure_window > 3600) {
-            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                "pgp_auth: pgp_auth_failure_window %Ts is outside 1s..1h; "
-                "using 60s", conf->failure_window);
-            conf->failure_window = 60;
-        }
-        if (conf->failure_ban_time < 1 || conf->failure_ban_time > 86400) {
-            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                "pgp_auth: pgp_auth_failure_ban_time %Ts is outside 1s..24h; "
-                "using 300s", conf->failure_ban_time);
-            conf->failure_ban_time = 300;
-        }
-
-        /*
-         * The throttle bans by the client address nginx sees. Behind a proxy
-         * without ngx_http_realip_module -- or on a Tor onion service, where
-         * every request arrives from the local daemon -- that address is the
-         * same for everyone, so one abusive client would lock out all of them.
-         */
-        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
-            "pgp_auth: the failure throttle bans by client address; behind a "
-            "proxy configure ngx_http_realip_module, otherwise every client "
-            "shares one address and a single abuser locks out all of them");
-    }
-
     if (conf->challenge_timeout < 5) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
             "pgp_auth: pgp_challenge_timeout %Ts is below the 5s minimum; "
@@ -2236,6 +2196,44 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_sec_value(conf->failure_ban_time, prev->failure_ban_time, 300);
     ngx_conf_merge_size_value(conf->failure_zone_size, prev->failure_zone_size,
                               NGX_HTTP_PGP_THROTTLE_ZONE_SIZE);
+
+    /*
+     * Bound the remaining lifetimes, so a typo cannot quietly create
+     * near-permanent sessions or a throttle that never forgets.
+     *
+     * These checks MUST stay below the merges above. Before a merge the child
+     * still holds nginx's unset sentinel -- -1 for the times, the maximum
+     * unsigned value for the limit -- so a range test there fails on the
+     * sentinel and overwrites it with a default, and the merge then sees a
+     * value and never copies the parent's: a throttle configured at http{} or
+     * server{} silently ran with the hardcoded 60s window and 300s ban, and a
+     * session lifetime set above a location escaped the 30d cap. After the
+     * merge each field holds its final value, whether set here, inherited or
+     * defaulted. 0 keeps its documented meaning for pgp_session_timeout (no
+     * expiry) and passes through untouched.
+     */
+    if (conf->session_timeout > 2592000) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+            "pgp_auth: pgp_session_timeout %Ts is above the 30d maximum; "
+            "clamping to 2592000s (set 0 if you deliberately want no expiry)",
+            conf->session_timeout);
+        conf->session_timeout = 2592000;
+    }
+
+    if (conf->failure_limit > 0) {
+        if (conf->failure_window < 1 || conf->failure_window > 3600) {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                "pgp_auth: pgp_auth_failure_window %Ts is outside 1s..1h; "
+                "using 60s", conf->failure_window);
+            conf->failure_window = 60;
+        }
+        if (conf->failure_ban_time < 1 || conf->failure_ban_time > 86400) {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                "pgp_auth: pgp_auth_failure_ban_time %Ts is outside 1s..24h; "
+                "using 300s", conf->failure_ban_time);
+            conf->failure_ban_time = 300;
+        }
+    }
     ngx_conf_merge_str_value(conf->nonce_addr, prev->nonce_addr, "");
     ngx_conf_merge_value(conf->nonce_tls, prev->nonce_tls, 0);
     ngx_conf_merge_value(conf->nonce_tls_verify, prev->nonce_tls_verify, 1);
@@ -2415,6 +2413,36 @@ ngx_http_pgp_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             : ngx_http_pgp_throttle_add_zone(cf, conf->failure_zone_size);
         if (conf->failure_zone == NULL) {
             return NGX_CONF_ERROR;
+        }
+
+        /*
+         * Say what is actually in effect, once, at each level where the
+         * throttle is introduced or its parameters change. nginx -T prints the
+         * directives as written, not the merged values, so without this an
+         * operator cannot see whether a setting was inherited.
+         *
+         * Keyed on the parent having no throttle zone rather than on the
+         * parent's limit: the http{} configuration is only ever the parent in
+         * a merge, never merged itself, so a limit-based test would never fire
+         * for a throttle configured at http{}.
+         *
+         * The throttle bans by the client address nginx sees. Behind a proxy
+         * without ngx_http_realip_module -- or on a Tor onion service, where
+         * every request arrives from the local daemon -- that address is the
+         * same for everyone, so one abusive client would lock out all of them.
+         */
+        if (prev->failure_zone == NULL
+            || conf->failure_limit != prev->failure_limit
+            || conf->failure_window != prev->failure_window
+            || conf->failure_ban_time != prev->failure_ban_time)
+        {
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                "pgp_auth: failure throttle on: limit %ui, window %Ts, "
+                "ban %Ts; it bans by client address -- behind a proxy "
+                "configure ngx_http_realip_module, otherwise every client "
+                "shares one address and a single abuser locks out all of them",
+                conf->failure_limit, conf->failure_window,
+                conf->failure_ban_time);
         }
     }
 
