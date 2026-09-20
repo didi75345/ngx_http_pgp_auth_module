@@ -246,3 +246,9 @@ For the threat model, defensive design, and how memory safety is verified
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Donations
+
+If this module is useful to you, donations are welcome.
+
+**Bitcoin:** `bc1qvdu5l8255pmqt063a48g0sgngrz968me0n4jqt`
