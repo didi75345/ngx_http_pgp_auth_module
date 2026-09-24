@@ -1,0 +1,24 @@
+Architectures: amd64
+Codename: trixie
+Components: main
+Date: Thu, 24 Sep 2026 06:20:02 +0000
+Valid-Until: Sat, 24 Oct 2026 06:20:02 UTC
+Label: ngx_http_pgp_auth_module
+Origin: ngx_http_pgp_auth_module
+Suite: trixie
+MD5Sum:
+ 5fc3d149c89cfc3fbebb3934f7598fc5              172 Release
+ b45f654dcfc53a534147815610abb8ca             2507 main/binary-amd64/Packages
+ ba289be19f10a1212a0a0752022c9bf6             1318 main/binary-amd64/Packages.gz
+SHA1:
+ dd6b8c0f4dc07ce33b94004858da347b2d0e5798              172 Release
+ dfb6006303ffaf47091f4afa107da15404a45dbf             2507 main/binary-amd64/Packages
+ 226cf7344cc1897a24c934b24bcef64325c0e451             1318 main/binary-amd64/Packages.gz
+SHA256:
+ 256921094df108b20e995b50bd5736e8a985a9ed905dc698f1d906934cfe6e12              172 Release
+ 6ead641bebc60ecfe90f4b66847b58cb9bb9b67921191136718671f9e5926cd7             2507 main/binary-amd64/Packages
+ d0122c45205b51055432566b00f1d96e87450e23ebf35bf8e017bb94b14bdc9f             1318 main/binary-amd64/Packages.gz
+SHA512:
+ 698a1ac6f7783b6d5345cb21068c6051076ce8a8882d9a5dfd5c6087d6f955a6a5ea33e669e128349a49ea43831d470f1cfeb9d6af3cf92e66454f5fdf5f8895              172 Release
+ 1a05bef24acfe4b34343b7aa1babe33545fa44c1cf3420d39c6c45b0567973ade6a35670fde1a96d6ea6e6cbdc47298afeb9a1fe073d97cb7795b9a4e54f71c5             2507 main/binary-amd64/Packages
+ bc8fee83fa03996c1ca4d2247580715bc4a8b115542185cc1c18feeb8f5215eb65251e9005e21e19f24ad8328a4c0608d28dba61ce9330ff4f972f1d29b2662f             1318 main/binary-amd64/Packages.gz

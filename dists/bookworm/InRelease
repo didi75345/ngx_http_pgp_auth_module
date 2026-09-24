@@ -1,0 +1,34 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Architectures: amd64
+Codename: bookworm
+Components: main
+Date: Thu, 24 Sep 2026 06:20:02 +0000
+Valid-Until: Sat, 24 Oct 2026 06:20:02 UTC
+Label: ngx_http_pgp_auth_module
+Origin: ngx_http_pgp_auth_module
+Suite: bookworm
+MD5Sum:
+ c8aa3efa496b262b6c0dfea5241f343f              176 Release
+ cc34d79cab6a9be190300dd8b7a89b16             2518 main/binary-amd64/Packages
+ 148c64469692d2d60c035641121688b5             1320 main/binary-amd64/Packages.gz
+SHA1:
+ 7308f4d9596e6ec9e2730870d23eed8c2065b512              176 Release
+ 3cb40c1cbdbb098915c1e8401f177286e11fe452             2518 main/binary-amd64/Packages
+ 22dd342ce2389175e24c77d933d82398d82efbb9             1320 main/binary-amd64/Packages.gz
+SHA256:
+ aee9c6342eabacc95e520dc32a4463c5ae09e3bf7ad047c21ab6a9b0891e898a              176 Release
+ f78e58a4da15c323bd5d96875b4f9e468207af65bc41263c2c1aedaa1b37b3a2             2518 main/binary-amd64/Packages
+ c915e7cb34a6de2b6ec3f6bc6c15164b9fdebfc3d44c5134acae1521eb4cf9e5             1320 main/binary-amd64/Packages.gz
+SHA512:
+ 4a91f52a406b22c74d59de5648e98e1b82fa8cde09dfdb2c8f5997899c28352186b912ee66b858c49a826f5912fb04df6bef3b1d40369733124ec2b07df2c8b8              176 Release
+ cc93f30e8c91f55075f5f096cc8b05086e26f533c48cab4dd626e14e6b3b1435655840f1850a455cebde88a96395e26bfde08efb270b461113c86bfa97a32b92             2518 main/binary-amd64/Packages
+ dc1d286b74f97291a46ca02294d26de949cb41a0a4eaf237cb4ac19e14eb03687c578b00b123056143a77aab2c4f550bf4ec3b14bef12f6c023e048e7fba701d             1320 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQRauNtSe+3lreRzlsK1zb+2CZNspQUCarTBEgAKCRC1zb+2CZNs
+pTreAP0dAK8GtR11uE1ANvEyOkRyVkxstCIW3/l3UQWD84jmgAD/fD1HbV3g1kzY
+qQlAOKAt8pI1a4JIL0LIjB9xRWkt+w8=
+=cGKX
+-----END PGP SIGNATURE-----

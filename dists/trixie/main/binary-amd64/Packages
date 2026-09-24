@@ -1,0 +1,54 @@
+Package: libnginx-mod-http-pgp-auth-dbgsym
+Architecture: amd64
+Version: 1.0.0~trixie1
+Auto-Built-Package: debug-symbols
+Priority: optional
+Section: debug
+Source: nginx-pgp-auth
+Maintainer: didi75345 <didi75345@users.noreply.github.com>
+Installed-Size: 95
+Depends: libnginx-mod-http-pgp-auth (= 1.0.0~trixie1)
+Filename: pool/trixie/libnginx-mod-http-pgp-auth-dbgsym_1.0.0~trixie1_amd64.deb
+Size: 78272
+MD5sum: 548f58d4b7cb25f6ae372a9619296c1e
+SHA1: 5abdcc7ac2a4d39dfa5c20a32aa59ad1c8f7d977
+SHA256: a7d59ebe2c2dddc090d9d7a3104be732a6bd1975b98d98fe307bc8482aec446e
+SHA512: 43b017dab557fcf4e8a43daab615fcffe53515a839310071e3ac9b80df8d62b6d698b92dab5f48f899db8b95b4aaea978bcee7aa3598c9cf1a32d763e6afe7a6
+Description: debug symbols for libnginx-mod-http-pgp-auth
+Build-Ids: 6af18db69315af34cbff0c0c533c0198aa4da1f5
+
+Package: libnginx-mod-http-pgp-auth
+Architecture: amd64
+Version: 1.0.0~trixie1
+Priority: optional
+Section: httpd
+Source: nginx-pgp-auth
+Maintainer: didi75345 <didi75345@users.noreply.github.com>
+Installed-Size: 79
+Depends: libc6 (>= 2.34), libssl3t64 (>= 3.0.0), nginx-abi-1.26.3-1, gnupg
+Suggests: redis-server
+Filename: pool/trixie/libnginx-mod-http-pgp-auth_1.0.0~trixie1_amd64.deb
+Size: 23916
+MD5sum: 3728f1d84c376a4a8dd182a8884403bf
+SHA1: 367736bfc7f39683f3cf5dd830074de352e2bc7c
+SHA256: 0febf6ec8ab02e581b89a13ccf123fed175455af5930b12be67651382331fa77
+SHA512: fdbcd045fea2496d98286d1a34cffa78006c780fc1fa70c1735bb363c4f3f75578e62a3d308de2f65a6172521f35cbfb0c528545f550da4b55843862cd835e82
+Homepage: https://github.com/didi75345/ngx_http_pgp_auth_module
+Description: PGP-signature authentication module for nginx
+ ngx_http_pgp_auth is a native nginx module that authenticates users by PGP
+ signature, as a drop-in alternative to HTTP basic auth for protecting
+ reverse-proxied apps and internal tools.
+ .
+ A protected location serves a one-time challenge. The user signs it with
+ their own key (for example Kleopatra's Notepad), pastes the signed block
+ back, and the module verifies it against a public keyring before granting a
+ session. No passwords are stored or transmitted, and the user's private key
+ never leaves their machine.
+ .
+ Features include stateless HMAC-signed challenge and session tokens,
+ single-use challenge enforcement (in shared memory or via Redis), key
+ revocation by fingerprint, an adaptive per-IP failure throttle, and
+ non-blocking signature verification on an nginx thread pool.
+ .
+ This package provides the module built against this Debian release's nginx.
+
